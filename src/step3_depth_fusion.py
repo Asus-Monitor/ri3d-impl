@@ -320,8 +320,10 @@ def run_depth_fusion(cfg: RI3DConfig):
             sigma_color_scaled = cfg.bilateral_sigma_color / 255.0 * depth_range
             try:
                 # Joint bilateral filter: uses RGB edges to guide depth smoothing
+                # Both src and joint must have same dtype — convert guide to float32
+                guide_f32 = guide_img.astype(np.float32) / 255.0
                 fused_final = cv2.ximgproc.jointBilateralFilter(
-                    guide_img, fused_f32, cfg.bilateral_d,
+                    guide_f32, fused_f32, cfg.bilateral_d,
                     sigma_color_scaled, cfg.bilateral_sigma_space
                 )
             except AttributeError:

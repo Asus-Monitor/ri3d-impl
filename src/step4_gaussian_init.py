@@ -71,6 +71,7 @@ def generate_elliptical_cameras(poses: torch.Tensor, n_cameras: int,
     """Generate novel cameras along an elliptical path looking at the scene.
 
     Uses OpenCV camera convention (DUSt3R output): +X right, +Y down, +Z forward.
+    Cameras orbit in a horizontal plane around the scene center.
 
     Args:
         poses: (N, 4, 4) input camera-to-world matrices (OpenCV convention)
@@ -88,11 +89,9 @@ def generate_elliptical_cameras(poses: torch.Tensor, n_cameras: int,
     mean_forward = forwards.mean(dim=0)
     mean_forward = mean_forward / mean_forward.norm()
 
-    # Estimate scene center: average camera position + average depth along forward
-    # Use the mean distance between cameras as a rough depth proxy
+    # Estimate scene center if not provided
     if scene_center is None:
         cam_spread = (positions - cam_center).norm(dim=1).mean().item()
-        # Scene is roughly in front of cameras; use spread as depth estimate
         depth_est = max(cam_spread * 2.0, 0.5)
         scene_center = cam_center + depth_est * mean_forward
 
@@ -101,32 +100,32 @@ def generate_elliptical_cameras(poses: torch.Tensor, n_cameras: int,
     mean_up = ups.mean(dim=0)
     mean_up = mean_up / mean_up.norm()
 
-    # Build orthonormal basis for the orbit plane
-    # Right vector perpendicular to look direction and up
-    right = torch.linalg.cross(mean_forward, mean_up)
-    right = right / right.norm()
-    # Recompute up for orthogonality
-    mean_up = torch.linalg.cross(right, mean_forward)
-    mean_up = mean_up / mean_up.norm()
+    # Build two horizontal orbit axes around the scene center.
+    # axis1 = right (perpendicular to up and forward)
+    # axis2 = perpendicular to both up and axis1 (the other horizontal direction)
+    axis1 = torch.linalg.cross(mean_forward, mean_up)
+    axis1 = axis1 / axis1.norm()
+    axis2 = torch.linalg.cross(mean_up, axis1)
+    axis2 = axis2 / axis2.norm()
 
-    # Orbit radius: distance from scene center to cameras
+    # Orbit radius: mean distance from scene center to input cameras
     cam_to_scene = (positions - scene_center.unsqueeze(0)).norm(dim=1)
     orbit_radius = cam_to_scene.mean().item()
     orbit_radius = max(orbit_radius, 0.3)
 
-    # Height offset: keep novel cameras at same height as input cameras
+    # Height: keep novel cameras at the same height (along up) as input cameras
     offsets = positions - scene_center.unsqueeze(0)
     mean_height = (offsets @ mean_up).mean().item()
 
-    # Generate cameras on ellipse around scene center
+    # Generate cameras on horizontal circle around scene center
     angles = torch.linspace(0, 2 * math.pi, n_cameras + 1, device=poses.device)[:-1]
     novel_c2w = torch.zeros(n_cameras, 4, 4, device=poses.device)
 
     for i, angle in enumerate(angles):
-        # Position on orbit around scene center
+        # Position on horizontal orbit
         pos = (scene_center
-               + orbit_radius * torch.cos(angle) * right
-               + orbit_radius * torch.sin(angle) * mean_forward
+               + orbit_radius * torch.cos(angle) * axis1
+               + orbit_radius * torch.sin(angle) * axis2
                + mean_height * mean_up)
 
         # Look-at: forward direction from camera toward scene center
@@ -135,8 +134,11 @@ def generate_elliptical_cameras(poses: torch.Tensor, n_cameras: int,
 
         # Build camera axes (OpenCV: X=right, Y=down, Z=forward)
         r_vec = torch.linalg.cross(fwd, mean_up)
+        if r_vec.norm() < 1e-6:
+            # Camera looking straight up/down — use axis1 as fallback right
+            r_vec = axis1
         r_vec = r_vec / r_vec.norm()
-        down = torch.linalg.cross(fwd, r_vec)  # +Y = down in OpenCV
+        down = torch.linalg.cross(fwd, r_vec)
         # Ensure down points downward (same direction as -mean_up)
         if down @ (-mean_up) < 0:
             down = -down
