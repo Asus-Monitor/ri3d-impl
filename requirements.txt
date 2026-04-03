@@ -1,0 +1,36 @@
+# Core
+torch>=2.11.0
+torchvision
+
+# 3D Gaussian Splatting
+gsplat>=1.5.0
+
+# Diffusion models
+diffusers>=0.37.0
+transformers>=5.0.0
+peft>=0.18.0
+accelerate>=1.13.0
+safetensors
+
+# DUSt3R - install from github:
+# pip install git+https://github.com/naver/dust3r.git
+# OR clone and pip install -e .
+
+# Depth Anything V2 - uses transformers pipeline, no extra install
+
+# Image processing
+# opencv-contrib-python preferred (for joint bilateral filter); opencv-python works as fallback
+opencv-contrib-python>=4.8.0
+Pillow>=10.0.0
+scipy>=1.10.0
+
+# Perceptual loss
+lpips
+
+# Clustering for background mask
+scikit-learn
+
+# Visualization / utils
+matplotlib
+numpy
+tqdm

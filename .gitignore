@@ -1,0 +1,5 @@
+*.pyc
+dataset/*
+*.pt
+dust3r
+croco

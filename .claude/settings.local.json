@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip --version)",
+      "Bash(python -c \"import torch; print\\(f'torch {torch.__version__}, cuda {torch.version.cuda}, avail={torch.cuda.is_available\\(\\)}'\\)\")",
+      "Bash(python:*)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:github.com)"
+    ]
+  }
+}

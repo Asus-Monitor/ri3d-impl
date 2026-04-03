@@ -1,0 +1,132 @@
+"""Global configuration for RI3D pipeline."""
+from dataclasses import dataclass, field
+from pathlib import Path
+import torch
+
+@dataclass
+class RI3DConfig:
+    # Paths
+    scene_dir: Path = Path("dataset/garden")
+    dataset_dir: Path = Path("dataset")  # parent dir with all scene subdirs
+    output_dir: Path = Path("outputs")
+
+    # View selection
+    n_views: int = 3  # number of input views to select from each scene
+
+    # Device
+    device: str = "cuda"
+    dtype: torch.dtype = torch.float16
+
+    # Image size (diffusion models operate at 512x512)
+    diffusion_size: int = 512
+    render_size: tuple = (512, 512)  # H, W for 3DGS rendering
+
+    # DUSt3R
+    dust3r_model: str = "naver/DUSt3R_ViTLarge_BaseDecoder_512_dpt"
+    dust3r_confidence_threshold: float = 3.0  # log-confidence threshold for high-conf mask
+
+    # Depth Anything V2
+    depth_model: str = "depth-anything/Depth-Anything-V2-Small-hf"
+
+    # Depth fusion (Poisson blending)
+    poisson_lambda: float = 10.0  # gradient term weight (Eq. 2)
+    bilateral_d: int = 9
+    bilateral_sigma_color: float = 75.0
+    bilateral_sigma_space: float = 75.0
+
+    # Gaussian initialization
+    gaussian_scale_factor: float = 1.4  # scale relative to pixel size
+    gaussian_init_opacity: float = 0.1
+
+    # Repair model (ControlNet)
+    sd_model: str = "stable-diffusion-v1-5/stable-diffusion-v1-5"
+    controlnet_model: str = "lllyasviel/control_v11f1e_sd15_tile"
+    lcm_lora: str = "latent-consistency/lcm-lora-sdv1-5"
+    repair_train_iters: int = 1800
+    repair_lr: float = 1e-5
+    repair_lora_rank: int = 8
+    lcm_inference_steps: int = 4
+    lcm_guidance_scale: float = 1.5
+
+    # Leave-one-out training for repair
+    loo_initial_iters: int = 6000  # iters before re-adding left-out view
+    loo_total_iters: int = 10000   # total iters for leave-one-out 3DGS
+    loo_snapshot_interval: int = 500  # snapshot corrupted renders every N iters after re-add
+
+    # Inpainting model
+    inpainting_train_iters: int = 2000
+    inpainting_lr: float = 1e-5
+    inpainting_lora_rank: int = 8
+
+    # Stage 1 optimization
+    stage1_max_iters: int = 4000
+    stage1_num_novel_views: int = 8
+    stage1_refresh_interval: int = 400  # refresh repaired pseudo GT every N iters
+    stage1_lr_position: float = 1.6e-4
+    stage1_lr_opacity: float = 0.05
+    stage1_lr_scaling: float = 5e-3
+    stage1_lr_rotation: float = 1e-3
+    stage1_lr_sh: float = 2.5e-3
+
+    # Stage 2 optimization
+    stage2_max_iters: int = 4000
+    stage2_num_novel_views: int = 10
+    stage2_num_inpaint_views: int = 5  # K views to inpaint per cycle
+    stage2_inpaint_interval: int = 200
+    stage2_inpaint_cutoff: int = 2800  # stop inpainting after this iter, only repair
+
+    # Loss weights
+    loss_l1_weight: float = 0.8
+    loss_ssim_weight: float = 0.2
+    loss_lpips_weight: float = 0.1
+    loss_depth_corr_weight: float = 0.1
+    loss_opacity_reg_weight: float = 0.01
+
+    # Plateau detection (replaces fixed iteration counts)
+    plateau_window: int = 200      # look-back window in iterations
+    plateau_threshold: float = 1e-4  # min relative improvement to continue
+    plateau_min_iters: int = 1000   # minimum iters before allowing early stop
+
+    # 3DGS densification
+    densify_start: int = 500
+    densify_stop: int = 3000
+    densify_interval: int = 100
+    densify_grad_threshold: float = 0.0002
+
+    # Checkpointing
+    checkpoint_dir: Path = Path("outputs/checkpoints")
+
+    # Background mask clustering
+    bg_mask_n_clusters: int = 2  # agglomerative clustering on depth
+
+    def __post_init__(self):
+        self.scene_dir = Path(self.scene_dir)
+        self.dataset_dir = Path(self.dataset_dir)
+        self.output_dir = Path(self.output_dir)
+        self.checkpoint_dir = Path(self.checkpoint_dir)
+
+    @property
+    def scene_name(self) -> str:
+        return self.scene_dir.name
+
+    def scene_output_dir(self) -> Path:
+        d = self.output_dir / self.scene_name
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def shared_model_dir(self) -> Path:
+        """Directory for models trained across all scenes."""
+        d = self.output_dir / "_shared_models"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def list_scenes(self) -> list[Path]:
+        """List all scene subdirectories in dataset_dir."""
+        exts = {".jpg", ".jpeg", ".png", ".bmp", ".tiff"}
+        scenes = []
+        for d in sorted(self.dataset_dir.iterdir()):
+            if d.is_dir():
+                has_images = any(p.suffix.lower() in exts for p in d.iterdir())
+                if has_images:
+                    scenes.append(d)
+        return scenes
