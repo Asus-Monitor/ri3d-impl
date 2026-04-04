@@ -32,42 +32,62 @@ def load_scene_images(scene_dir: Path) -> list[str]:
     return [str(p) for p in paths]
 
 
+def _resolve_names(names: list[str], image_paths: list[str]) -> list[str]:
+    """Resolve a list of filenames/stems to full paths from image_paths."""
+    available = {Path(p).name: p for p in image_paths}
+    selected = []
+    for name in names:
+        name = name.strip()
+        if not name:
+            continue
+        if name in available:
+            selected.append(available[name])
+        else:
+            stem = Path(name).stem
+            matches = [p for p in image_paths if Path(p).stem == stem]
+            if matches:
+                selected.append(matches[0])
+            else:
+                raise FileNotFoundError(
+                    f"View '{name}' not found in {list(available.keys())}"
+                )
+    return selected
+
+
 def select_views(image_paths: list[str], n_views, scene_dir: Path = None) -> list[str]:
     """Select views from the full set.
 
-    n_views can be:
-      - int: evenly sample that many views
-      - str of comma-separated filenames: use those specific files
-        e.g. "DSC_001.jpg,DSC_005.jpg,DSC_010.jpg"
+    Priority:
+      1. views.txt in scene_dir (one filename per line) — used for multi-scene prep
+      2. n_views as comma-separated filenames — used for single-scene CLI
+      3. n_views as int — evenly sample that many views (fallback)
     """
+    # 1. Check for views.txt in scene directory
+    if scene_dir is not None:
+        views_file = Path(scene_dir) / "views.txt"
+        if views_file.exists():
+            names = views_file.read_text().strip().splitlines()
+            names = [n.strip() for n in names if n.strip()]
+            selected = _resolve_names(names, image_paths)
+            print(f"Selected {len(selected)} views from views.txt: "
+                  f"{[Path(p).name for p in selected]}")
+            return selected
+
+    # 2. Comma-separated filenames from CLI
     if isinstance(n_views, str) and not n_views.isdigit():
-        # Comma-separated filenames
-        names = [s.strip() for s in n_views.split(",") if s.strip()]
-        selected = []
-        available = {Path(p).name: p for p in image_paths}
-        for name in names:
-            if name in available:
-                selected.append(available[name])
-            else:
-                # Try matching without extension
-                stem = Path(name).stem
-                matches = [p for p in image_paths if Path(p).stem == stem]
-                if matches:
-                    selected.append(matches[0])
-                else:
-                    raise FileNotFoundError(
-                        f"View '{name}' not found in {list(available.keys())}"
-                    )
-        print(f"Selected {len(selected)} specific views: {[Path(p).name for p in selected]}")
+        names = n_views.split(",")
+        selected = _resolve_names(names, image_paths)
+        print(f"Selected {len(selected)} specific views: "
+              f"{[Path(p).name for p in selected]}")
         return selected
 
+    # 3. Evenly spaced selection by count
     n_views = int(n_views)
     n = len(image_paths)
     if n <= n_views:
         print(f"Using all {n} images (requested {n_views})")
         return image_paths
 
-    # Evenly spaced selection
     indices = [int(round(i * (n - 1) / (n_views - 1))) for i in range(n_views)]
     selected = [image_paths[i] for i in indices]
     print(f"Selected {n_views} views from {n} images: indices {indices}")

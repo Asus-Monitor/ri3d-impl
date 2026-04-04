@@ -386,7 +386,7 @@ if __name__ == "__main__":
     parser.add_argument("--scene", type=str, required=True, help="Path to scene dir (or dataset root)")
     parser.add_argument("--dataset", type=str, default="dataset", help="Dataset root with all scenes")
     parser.add_argument("--output", type=str, default="outputs", help="Output directory")
-    parser.add_argument("--n_views", type=int, default=3, help="Number of input views per scene")
+    parser.add_argument("--n_views", type=str, default="3", help="Number of input views per scene")
     parser.add_argument("--data_only", action="store_true", help="Only generate data, don't train")
     parser.add_argument("--train_only", action="store_true", help="Only train, assume data exists")
     args = parser.parse_args()

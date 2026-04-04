@@ -124,7 +124,10 @@ def main():
     parser.add_argument("--scene", type=str, default=None, help="Path to a single scene directory")
     parser.add_argument("--dataset", type=str, default="dataset", help="Dataset root (all scenes)")
     parser.add_argument("--output", type=str, default="outputs", help="Output directory")
-    parser.add_argument("--n_views", type=int, default=3, help="Number of input views per scene")
+    parser.add_argument("--n_views", type=str, default="3",
+                        help="Number of views (int), or comma-separated filenames "
+                             "e.g. 'DSC_001.jpg,DSC_005.jpg' (only with --scene). "
+                             "For multi-scene prep, use views.txt in each scene dir.")
 
     # Mode flags
     parser.add_argument("--prep", action="store_true", help="Run steps 1-4 for all scenes")
@@ -136,6 +139,12 @@ def main():
     parser.add_argument("--only", action="store_true", help="Run only the specified --step")
 
     args = parser.parse_args()
+
+    # Validate: comma-separated filenames only with --scene
+    is_filename_list = not args.n_views.isdigit()
+    if is_filename_list and args.scene is None:
+        parser.error("--n_views with filenames requires --scene. "
+                     "For multi-scene prep, use views.txt in each scene dir.")
 
     # Build config
     scene_dir = Path(args.scene) if args.scene else Path(args.dataset)

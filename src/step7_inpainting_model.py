@@ -286,7 +286,7 @@ if __name__ == "__main__":
     parser.add_argument("--scene", type=str, required=True, help="Path to scene dir")
     parser.add_argument("--dataset", type=str, default="dataset", help="Dataset root")
     parser.add_argument("--output", type=str, default="outputs", help="Output directory")
-    parser.add_argument("--n_views", type=int, default=3, help="Number of input views")
+    parser.add_argument("--n_views", type=str, default="3", help="Number of input views per scene")
     args = parser.parse_args()
 
     cfg = RI3DConfig(scene_dir=Path(args.scene), dataset_dir=Path(args.dataset),
