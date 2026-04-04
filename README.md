@@ -6,32 +6,38 @@ Makes a gaussian splat from very few images (down to 3). Existing solutions (COL
 
 RI3D cleans up the floaters and inpaints holes with stable diffusion automatically. 
 
-## Dataset
+## Training
+
+Since we are just fine tuning models, you can train it yourself on a consumer level gpu. Works on my RTX 2060 Super. Cuda GPU required.
+
+All commands run from `src/`.
+
+**Preprocessing** (Steps 1-4):
+
+```bash
+python run_pipeline.py --dataset ../dataset --output ../output --prep
+```
+
+**Training all models** (Steps 5+7):
+
+```bash
+python run_pipeline.py --dataset ../dataset --output ../output --train_models
+```
+
+### Dataset
 
 ```bash
 wget http://storage.googleapis.com/gresearch/refraw360/360_v2.zip -O 360_v2.zip
 ./extract_dataset.sh
 ```
 
-Extracts only the images from each scene in `360_v2` into `dataset/`. Requires `p7zip` (`7z` command).
+Downloads & extracts only the images from each scene in `360_v2` into `dataset/`. Requires `p7zip` (`7z` command).
 
 ## Usage
 
 All commands run from `src/`.
 
-**Steps 1-4** (preprocessing):
-
-```bash
-python run_pipeline.py --dataset ../dataset --output ../output --prep
-```
-
-**Steps 5+7** (train all models):
-
-```bash
-python run_pipeline.py --dataset ../dataset --output ../output --train_models
-```
-
-**Steps 6+8** (train single scene):
+**Steps 6+8** (make splat scene):
 
 ```bash
 python run_pipeline.py --dataset ../dataset --output ../output --train_models --scene ../dataset/garden --n_views "A,B,C"
