@@ -254,7 +254,7 @@ def run_depth_fusion(cfg: RI3DConfig):
     fused_dir = out_dir / "fused_depths"
     fused_dir.mkdir(parents=True, exist_ok=True)
 
-    image_paths = torch.load(out_dir / "image_paths.pt", weights_only=False)
+    image_paths = cfg.load_image_paths()
     n_images = len(image_paths)
 
     print(f"Fusing depth maps for {n_images} views (lambda={cfg.poisson_lambda})...")

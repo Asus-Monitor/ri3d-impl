@@ -212,7 +212,7 @@ def init_gaussians(cfg: RI3DConfig):
     """Initialize Gaussians from fused depth maps."""
     out_dir = cfg.scene_output_dir()
 
-    image_paths = torch.load(out_dir / "image_paths.pt", weights_only=False)
+    image_paths = cfg.load_image_paths()
     poses = torch.load(out_dir / "dust3r_poses.pt", weights_only=True)      # (N, 4, 4) c2w
     intrinsics = torch.load(out_dir / "dust3r_intrinsics.pt", weights_only=True)  # (N, 3, 3)
     n_images = len(image_paths)
@@ -308,7 +308,7 @@ def render_initial_views(cfg: RI3DConfig):
     gaussians = torch.load(out_dir / "init_gaussians.pt", weights_only=True)
     poses = torch.load(out_dir / "dust3r_poses.pt", weights_only=True).float().to(device)
     intrinsics = torch.load(out_dir / "dust3r_intrinsics.pt", weights_only=True).float().to(device)
-    image_paths = torch.load(out_dir / "image_paths.pt", weights_only=False)
+    image_paths = cfg.load_image_paths()
 
     # Move to device
     means = gaussians["means"].float().to(device)

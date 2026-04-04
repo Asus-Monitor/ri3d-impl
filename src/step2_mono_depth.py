@@ -34,7 +34,7 @@ def run_mono_depth(cfg: RI3DConfig, depth_pipe=None):
     mono_dir.mkdir(parents=True, exist_ok=True)
 
     # Load image paths from step 1
-    image_paths = torch.load(out_dir / "image_paths.pt", weights_only=False)
+    image_paths = cfg.load_image_paths()
     n_images = len(image_paths)
 
     # Load depth estimation pipeline if not provided externally

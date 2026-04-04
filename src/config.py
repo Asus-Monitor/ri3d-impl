@@ -135,6 +135,11 @@ class RI3DConfig:
         d.mkdir(parents=True, exist_ok=True)
         return d
 
+    def load_image_paths(self) -> list[str]:
+        """Load image_paths.pt for this scene."""
+        import torch
+        return torch.load(self.scene_output_dir() / "image_paths.pt", weights_only=False)
+
     def list_scenes(self) -> list[Path]:
         """List all scene subdirectories in dataset_dir."""
         exts = {".jpg", ".jpeg", ".png", ".bmp", ".tiff"}

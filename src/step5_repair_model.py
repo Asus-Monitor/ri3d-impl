@@ -41,7 +41,7 @@ def generate_leave_one_out_data(cfg: RI3DConfig):
     data_dir = out_dir / "repair_training_data"
     data_dir.mkdir(parents=True, exist_ok=True)
 
-    image_paths = torch.load(out_dir / "image_paths.pt", weights_only=False)
+    image_paths = cfg.load_image_paths()
     poses = torch.load(out_dir / "dust3r_poses.pt", weights_only=True).float()
     intrinsics = torch.load(out_dir / "dust3r_intrinsics.pt", weights_only=True).float()
     gaussians_init = torch.load(out_dir / "init_gaussians.pt", weights_only=True)

@@ -10,8 +10,6 @@ RI3D cleans up the floaters and inpaints holes with stable diffusion automatical
 
 Since we are just fine tuning models, you can train it yourself on a consumer level gpu. Works on my RTX 2060 Super. Cuda GPU required.
 
-All commands run from `src/`. Paths default to `<project_root>/dataset` and `<project_root>/output`.
-
 **Preprocessing** (Steps 1-4):
 
 ```bash
@@ -25,6 +23,7 @@ python src/run_pipeline.py --train_models
 ```
 
 ### Dataset
+I used the [mip-nerf 360 dataset](https://jonbarron.info/mipnerf360/) for training. 
 
 ```bash
 wget http://storage.googleapis.com/gresearch/refraw360/360_v2.zip -O 360_v2.zip
@@ -34,11 +33,9 @@ wget http://storage.googleapis.com/gresearch/refraw360/360_v2.zip -O 360_v2.zip
 Downloads & extracts only the images from each scene in `360_v2` into `dataset/`. Requires `p7zip` (`7z` command).
 
 ## Usage
-
-All commands run from `src/`.
-
-**Steps 6+8** (make splat scene):
+Make a new folder with your scene name in dataset. Then place your three images there. Then run prep and optimize step.
 
 ```bash
-python src/run_pipeline.py --optimize --scene ../dataset/garden --n_views "A,B,C"
+python src/run_pipeline.py --prep
+python src/run_pipeline.py --optimize --scene dataset/your-scene
 ```

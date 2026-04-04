@@ -127,7 +127,7 @@ def run_stage1(cfg: RI3DConfig):
     device = cfg.device
 
     # Load scene data
-    image_paths = torch.load(out_dir / "image_paths.pt", weights_only=False)
+    image_paths = cfg.load_image_paths()
     poses = torch.load(out_dir / "dust3r_poses.pt", weights_only=True).float().to(device)
     intrinsics = torch.load(out_dir / "dust3r_intrinsics.pt", weights_only=True).float().to(device)
     gaussians_init = torch.load(out_dir / "init_gaussians.pt", weights_only=True)
