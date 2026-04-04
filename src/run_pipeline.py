@@ -159,19 +159,104 @@ def run_prep_all_scenes(cfg: RI3DConfig):
 
 
 def run_train_models(cfg: RI3DConfig):
-    """Train shared repair + inpainting models on all scenes."""
+    """Train per-scene repair + inpainting models for all scenes.
+
+    Loads frozen SD components once and shares them across scenes to avoid
+    redundant model loading. Each scene gets its own personalized LoRA weights.
+    """
+    import torch
     from step5_repair_model import run_step5
     from step7_inpainting_model import run_step7
 
+    scene_cfgs = _build_scene_cfgs(cfg)
+    # Only train for scenes that have completed prep (steps 1-4)
+    ready = [sc for sc in scene_cfgs
+             if (sc.scene_output_dir() / "init_gaussians.pt").exists()]
+    if not ready:
+        print("No prepared scenes found. Run --prep first.")
+        return
+
     print(f"\n{'='*60}")
-    print(f"  Training shared models on all scenes")
-    print(f"{'='*60}\n")
+    print(f"  Training per-scene models ({len(ready)} scenes)")
+    print(f"{'='*60}")
 
-    print("--- Step 5: Repair Model ---")
-    run_step5(cfg)
+    # --- Step 5: Repair models (share SD 1.5 components) ---
+    need_repair = [sc for sc in ready
+                   if not (sc.scene_output_dir() / "repair_model").exists()]
+    if need_repair:
+        print(f"\n--- Step 5: Repair Model — {len(need_repair)} scenes ---")
+        from diffusers import AutoencoderKL, UNet2DConditionModel, DDPMScheduler
+        from transformers import CLIPTextModel, CLIPTokenizer
 
-    print("\n--- Step 7: Inpainting Model ---")
-    run_step7(cfg)
+        dtype = cfg.dtype
+        device = cfg.device
+        print("Loading shared SD 1.5 components (frozen)...")
+        tokenizer = CLIPTokenizer.from_pretrained(cfg.sd_model, subfolder="tokenizer")
+        text_encoder = CLIPTextModel.from_pretrained(
+            cfg.sd_model, subfolder="text_encoder", torch_dtype=dtype).to(device)
+        vae = AutoencoderKL.from_pretrained(
+            cfg.sd_model, subfolder="vae", torch_dtype=dtype).to(device)
+        unet = UNet2DConditionModel.from_pretrained(
+            cfg.sd_model, subfolder="unet", torch_dtype=dtype).to(device)
+        noise_scheduler = DDPMScheduler.from_pretrained(cfg.sd_model, subfolder="scheduler")
+        text_encoder.requires_grad_(False)
+        vae.requires_grad_(False)
+        unet.requires_grad_(False)
+        with torch.no_grad():
+            tokens = tokenizer("", padding="max_length", max_length=77,
+                               return_tensors="pt").input_ids.to(device)
+            text_embeds = text_encoder(tokens)[0]
+
+        repair_components = {
+            "vae": vae, "unet": unet,
+            "text_embeds": text_embeds, "noise_scheduler": noise_scheduler,
+        }
+        for sc in need_repair:
+            print(f"\n--- {sc.scene_name} ---")
+            run_step5(sc, shared_components=repair_components)
+
+        del text_encoder, vae, unet, text_embeds, repair_components
+        torch.cuda.empty_cache()
+    else:
+        print("Step 5: all scenes already have repair models.")
+
+    # --- Step 7: Inpainting models (share SD inpainting components) ---
+    need_inpaint = [sc for sc in ready
+                    if not (sc.scene_output_dir() / "inpainting_model").exists()]
+    if need_inpaint:
+        print(f"\n--- Step 7: Inpainting Model — {len(need_inpaint)} scenes ---")
+        from diffusers import AutoencoderKL, DDPMScheduler
+        from transformers import CLIPTextModel, CLIPTokenizer
+
+        dtype = cfg.dtype
+        device = cfg.device
+        inpaint_model_id = "runwayml/stable-diffusion-inpainting"
+        print("Loading shared SD inpainting components (frozen)...")
+        tokenizer = CLIPTokenizer.from_pretrained(inpaint_model_id, subfolder="tokenizer")
+        text_encoder = CLIPTextModel.from_pretrained(
+            inpaint_model_id, subfolder="text_encoder", torch_dtype=dtype).to(device)
+        vae = AutoencoderKL.from_pretrained(
+            inpaint_model_id, subfolder="vae", torch_dtype=dtype).to(device)
+        noise_scheduler = DDPMScheduler.from_pretrained(inpaint_model_id, subfolder="scheduler")
+        text_encoder.requires_grad_(False)
+        vae.requires_grad_(False)
+        with torch.no_grad():
+            tokens = tokenizer("", padding="max_length", max_length=77,
+                               return_tensors="pt").input_ids.to(device)
+            text_embeds = text_encoder(tokens)[0]
+
+        inpaint_components = {
+            "vae": vae, "text_embeds": text_embeds,
+            "noise_scheduler": noise_scheduler,
+        }
+        for sc in need_inpaint:
+            print(f"\n--- {sc.scene_name} ---")
+            run_step7(sc, shared_components=inpaint_components)
+
+        del text_encoder, vae, text_embeds, inpaint_components
+        torch.cuda.empty_cache()
+    else:
+        print("Step 7: all scenes already have inpainting models.")
 
 
 def run_optimize_scene(cfg: RI3DConfig):

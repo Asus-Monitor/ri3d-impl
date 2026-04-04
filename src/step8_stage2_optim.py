@@ -40,11 +40,11 @@ from step6_stage1_optim import (
 
 
 def load_inpainting_pipeline(cfg: RI3DConfig):
-    """Load the trained inpainting model for inference (from shared model dir)."""
+    """Load the trained inpainting model for inference (per-scene LoRA)."""
     from diffusers import StableDiffusionInpaintPipeline, LCMScheduler
     from peft import PeftModel
 
-    model_dir = cfg.shared_model_dir() / "inpainting_model"
+    model_dir = cfg.scene_output_dir() / "inpainting_model"
     dtype = cfg.dtype
     device = cfg.device
 

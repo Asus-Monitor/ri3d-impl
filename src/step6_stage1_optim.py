@@ -34,7 +34,7 @@ from step4_gaussian_init import generate_elliptical_cameras
 
 
 def load_repair_pipeline(cfg: RI3DConfig):
-    """Load the trained repair model for inference (from shared model dir)."""
+    """Load the trained repair model for inference (per-scene LoRA)."""
     from diffusers import (
         StableDiffusionControlNetPipeline,
         ControlNetModel,
@@ -42,7 +42,7 @@ def load_repair_pipeline(cfg: RI3DConfig):
     )
     from peft import PeftModel
 
-    model_dir = cfg.shared_model_dir() / "repair_model"
+    model_dir = cfg.scene_output_dir() / "repair_model"
     dtype = cfg.dtype
     device = cfg.device
 

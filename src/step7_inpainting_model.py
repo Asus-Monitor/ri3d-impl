@@ -1,16 +1,13 @@
 """Step 7: Train the Inpainting Model (SD Inpainting + LoRA, RealFill-style).
 
-Trains a SINGLE inpainting model on images from ALL scenes.
-
 Per the paper (Sec 4.2, 8.2):
-  - Fine-tune SD inpainting model on input images via random masking (RealFill approach)
-  - This personalizes the model so hallucinated content matches the visual style
+  - Fine-tune SD inpainting model on the scene's input images via random masking
+  - This personalizes the model so hallucinated content matches the scene's visual style
   - Images are resized so smallest dim = 512, then random 512x512 crop
-  - Fine-tune for ~2000 iterations (scaled by number of scenes)
+  - Fine-tune for 2000 iterations per scene
 
 Outputs:
-  - outputs/_shared_models/inpainting_model/  shared LoRA weights
-  - outputs/<scene>/inpainting_test/          test results per scene
+  - outputs/<scene>/inpainting_model/   per-scene LoRA weights
 """
 import argparse
 import random
@@ -43,40 +40,36 @@ def generate_random_mask(H: int, W: int, min_ratio: float = 0.1,
     return mask
 
 
-def collect_all_scene_images(cfg: RI3DConfig) -> list[Image.Image]:
-    """Collect input images from all scenes, resized for diffusion training.
+def collect_scene_images(cfg: RI3DConfig) -> list[Image.Image]:
+    """Collect this scene's input images, resized for diffusion training.
 
     Per paper: resize so smallest dim = 512, then random 512x512 crop during training.
     """
-    scenes = cfg.list_scenes()
-    all_images = []
+    image_paths = cfg.load_image_paths()
+    images = []
 
-    for scene_dir in scenes:
-        scene_cfg = RI3DConfig(scene_dir=scene_dir, output_dir=cfg.output_dir)
-        paths_file = scene_cfg.scene_output_dir() / "image_paths.pt"
-        if not paths_file.exists():
-            print(f"  Skipping {scene_dir.name}: no image_paths.pt (run steps 1-4 first)")
-            continue
-        image_paths = torch.load(paths_file, weights_only=False)
+    for ip in image_paths:
+        img = Image.open(ip).convert("RGB")
+        w, h = img.size
+        if h < w:
+            new_h, new_w = 512, int(w * 512 / h)
+        else:
+            new_w, new_h = 512, int(h * 512 / w)
+        img = img.resize((new_w, new_h), Image.LANCZOS)
+        images.append(img)
 
-        for ip in image_paths:
-            img = Image.open(ip).convert("RGB")
-            w, h = img.size
-            if h < w:
-                new_h, new_w = 512, int(w * 512 / h)
-            else:
-                new_w, new_h = 512, int(h * 512 / w)
-            img = img.resize((new_w, new_h), Image.LANCZOS)
-            all_images.append(img)
-
-        print(f"  {scene_dir.name}: {len(image_paths)} images")
-
-    print(f"Total images for inpainting training: {len(all_images)}")
-    return all_images
+    print(f"Scene {cfg.scene_name}: {len(images)} images for inpainting training")
+    return images
 
 
-def train_inpainting_model(cfg: RI3DConfig):
-    """Train a SINGLE inpainting model on images from ALL scenes."""
+def train_inpainting_model(cfg: RI3DConfig, shared_components=None):
+    """Train a per-scene inpainting model on this scene's input images.
+
+    Args:
+        cfg: scene config
+        shared_components: optional dict with pre-loaded frozen SD inpainting components
+            (vae, text_embeds, noise_scheduler) to avoid reloading per scene
+    """
     from diffusers import (
         AutoencoderKL,
         UNet2DConditionModel,
@@ -85,33 +78,42 @@ def train_inpainting_model(cfg: RI3DConfig):
     from transformers import CLIPTextModel, CLIPTokenizer
     from peft import LoraConfig, get_peft_model
 
-    model_dir = cfg.shared_model_dir() / "inpainting_model"
+    model_dir = cfg.scene_output_dir() / "inpainting_model"
     model_dir.mkdir(parents=True, exist_ok=True)
 
     device = cfg.device
     dtype = cfg.dtype
-
-    # Collect images from all scenes
-    all_images = collect_all_scene_images(cfg)
-    if len(all_images) == 0:
-        raise RuntimeError("No images found. Run steps 1-4 on all scenes first.")
-
-    # Load SD inpainting (9-channel UNet)
-    print("Loading SD 1.5 inpainting model...")
     inpaint_model_id = "runwayml/stable-diffusion-inpainting"
 
-    tokenizer = CLIPTokenizer.from_pretrained(inpaint_model_id, subfolder="tokenizer")
-    text_encoder = CLIPTextModel.from_pretrained(inpaint_model_id, subfolder="text_encoder",
-                                                  torch_dtype=dtype).to(device)
-    vae = AutoencoderKL.from_pretrained(inpaint_model_id, subfolder="vae",
-                                         torch_dtype=dtype).to(device)
+    # Collect this scene's images
+    scene_images = collect_scene_images(cfg)
+    if len(scene_images) == 0:
+        raise RuntimeError(f"No images for {cfg.scene_name}. Run steps 1-4 first.")
+
+    # Use shared frozen components if provided, otherwise load our own
+    _owns_components = shared_components is None
+    if _owns_components:
+        print("Loading SD 1.5 inpainting model...")
+        tokenizer = CLIPTokenizer.from_pretrained(inpaint_model_id, subfolder="tokenizer")
+        text_encoder = CLIPTextModel.from_pretrained(inpaint_model_id, subfolder="text_encoder",
+                                                      torch_dtype=dtype).to(device)
+        vae = AutoencoderKL.from_pretrained(inpaint_model_id, subfolder="vae",
+                                             torch_dtype=dtype).to(device)
+        noise_scheduler = DDPMScheduler.from_pretrained(inpaint_model_id, subfolder="scheduler")
+        text_encoder.requires_grad_(False)
+        vae.requires_grad_(False)
+        with torch.no_grad():
+            tokens = tokenizer("", padding="max_length", max_length=77,
+                               return_tensors="pt").input_ids.to(device)
+            text_embeds = text_encoder(tokens)[0]
+    else:
+        vae = shared_components["vae"]
+        text_embeds = shared_components["text_embeds"]
+        noise_scheduler = shared_components["noise_scheduler"]
+
+    # Fresh UNet + LoRA for this scene
     unet = UNet2DConditionModel.from_pretrained(inpaint_model_id, subfolder="unet",
                                                  torch_dtype=dtype).to(device)
-    noise_scheduler = DDPMScheduler.from_pretrained(inpaint_model_id, subfolder="scheduler")
-
-    text_encoder.requires_grad_(False)
-    vae.requires_grad_(False)
-
     lora_config = LoraConfig(
         r=cfg.inpainting_lora_rank,
         lora_alpha=cfg.inpainting_lora_rank,
@@ -123,19 +125,12 @@ def train_inpainting_model(cfg: RI3DConfig):
 
     optimizer = torch.optim.AdamW(unet.parameters(), lr=cfg.inpainting_lr, weight_decay=1e-2)
 
-    with torch.no_grad():
-        tokens = tokenizer("", padding="max_length", max_length=77,
-                           return_tensors="pt").input_ids.to(device)
-        text_embeds = text_encoder(tokens)[0]
-
-    # Scale iterations by number of scenes
-    n_scenes = len(cfg.list_scenes())
-    n_iters = max(cfg.inpainting_train_iters, cfg.inpainting_train_iters * n_scenes // 2)
-    print(f"Training inpainting LoRA for {n_iters} iterations on {len(all_images)} images...")
+    n_iters = cfg.inpainting_train_iters
+    print(f"Training inpainting LoRA for {n_iters} iterations on {len(scene_images)} images...")
     losses = []
 
-    for step in tqdm(range(n_iters), desc="Inpainting training"):
-        img_pil = random.choice(all_images)
+    for step in tqdm(range(n_iters), desc=f"Inpainting [{cfg.scene_name}]"):
+        img_pil = random.choice(scene_images)
         w, h = img_pil.size
 
         # Random 512x512 crop
@@ -175,17 +170,19 @@ def train_inpainting_model(cfg: RI3DConfig):
             print(f"  Step {step+1}: loss = {avg_loss:.6f}")
 
     unet.save_pretrained(model_dir)
-    print(f"Saved shared inpainting model to {model_dir}")
+    print(f"Saved inpainting model to {model_dir}")
 
     fig, ax = plt.subplots(figsize=(10, 4))
     ax.plot(losses)
     ax.set_xlabel("Step")
     ax.set_ylabel("Loss")
-    ax.set_title("Inpainting Model Training Loss (all scenes)")
+    ax.set_title(f"Inpainting Model Training Loss — {cfg.scene_name}")
     fig.savefig(model_dir / "training_loss.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
 
-    del text_encoder, vae, unet, optimizer
+    del unet, optimizer
+    if _owns_components:
+        del text_encoder, vae
     torch.cuda.empty_cache()
 
 
@@ -194,24 +191,11 @@ def test_inpainting_model(cfg: RI3DConfig):
     from diffusers import StableDiffusionInpaintPipeline, LCMScheduler
     from peft import PeftModel
 
-    # Find an actual scene to test on (when --train_models is used, cfg.scene_dir
-    # may point to the dataset root rather than a specific scene)
     out_dir = cfg.scene_output_dir()
-    image_paths_file = out_dir / "image_paths.pt"
-    if not image_paths_file.exists():
-        # Try to find any prepared scene in the dataset
-        scenes = cfg.list_scenes()
-        found = False
-        for scene_dir in scenes:
-            scene_out = cfg.output_dir / scene_dir.name
-            if (scene_out / "image_paths.pt").exists():
-                out_dir = scene_out
-                image_paths_file = out_dir / "image_paths.pt"
-                found = True
-                break
-        if not found:
-            print("No prepared scenes found, skipping inpainting test.")
-            return
+    model_dir = out_dir / "inpainting_model"
+    if not model_dir.exists():
+        print(f"No inpainting model for {cfg.scene_name}, skipping test.")
+        return
 
     test_dir = out_dir / "inpainting_test"
     test_dir.mkdir(parents=True, exist_ok=True)
@@ -219,20 +203,19 @@ def test_inpainting_model(cfg: RI3DConfig):
     device = cfg.device
     dtype = cfg.dtype
 
-    model_dir = cfg.shared_model_dir() / "inpainting_model"
-    print("Loading inpainting pipeline for test...")
+    print(f"Loading inpainting pipeline for test ({cfg.scene_name})...")
     inpaint_model_id = "runwayml/stable-diffusion-inpainting"
     pipe = StableDiffusionInpaintPipeline.from_pretrained(
         inpaint_model_id, torch_dtype=dtype
     ).to(device)
 
     pipe.unet = PeftModel.from_pretrained(pipe.unet, model_dir)
-    pipe.unet = pipe.unet.merge_and_unload()  # merge scene LoRA before adding LCM LoRA
+    pipe.unet = pipe.unet.merge_and_unload()
     pipe.scheduler = LCMScheduler.from_config(pipe.scheduler.config)
     pipe.load_lora_weights(cfg.lcm_lora, adapter_name="lcm")
     pipe.safety_checker = None
 
-    image_paths = torch.load(image_paths_file, weights_only=False)
+    image_paths = cfg.load_image_paths()
     n_test = min(3, len(image_paths))
 
     fig, axes = plt.subplots(3, n_test, figsize=(6 * n_test, 18))
@@ -276,8 +259,9 @@ def test_inpainting_model(cfg: RI3DConfig):
     print(f"Saved inpainting test results to {test_dir}")
 
 
-def run_step7(cfg: RI3DConfig):
-    train_inpainting_model(cfg)
+def run_step7(cfg: RI3DConfig, shared_components=None):
+    """Full step 7 for a single scene: train and test."""
+    train_inpainting_model(cfg, shared_components=shared_components)
     test_inpainting_model(cfg)
 
 

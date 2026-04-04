@@ -1,19 +1,16 @@
 """Step 5: Train the Repair Model (ControlNet + LoRA + LCM).
 
-This step has two phases:
-  A) Generate leave-one-out training data for each scene (per-scene)
-  B) Train a SINGLE repair model on ALL scenes' data combined (shared)
-
 Per the paper (Sec 4.2, 8.1):
-  1. Leave-one-out: create N subsets of N-1 images per scene
-  2. Train N small 3DGS representations (6000 iters without, then to 10000 with left-out)
-  3. Snapshot intermediate renders -> training pairs (corrupted, clean)
-  4. Fine-tune ControlNet (tile) with LoRA on ALL pairs from ALL scenes for 1800 iters
+  1. Leave-one-out: create N subsets of N-1 images, train N 3DGS reps
+     (6000 iters without left-out view, then to 10000 with it re-added)
+  2. Snapshot intermediate renders -> training pairs (corrupted, clean)
+  3. Fine-tune ControlNet (tile) with LoRA on this scene's pairs for 1800 iters
+
+Models are personalized per-scene so the repair model matches the scene's visual style.
 
 Outputs:
-  - outputs/<scene>/repair_training_data/  per-scene corrupted/clean pairs
-  - outputs/_shared_models/repair_model/   shared fine-tuned ControlNet LoRA weights
-  - outputs/<scene>/repair_test/           test repair results
+  - outputs/<scene>/repair_training_data/  corrupted/clean pairs
+  - outputs/<scene>/repair_model/          fine-tuned ControlNet LoRA weights
 """
 import argparse
 import random
@@ -167,8 +164,14 @@ def generate_all_scenes_data(cfg: RI3DConfig):
         generate_leave_one_out_data(scene_cfg)
 
 
-def train_repair_model(cfg: RI3DConfig):
-    """Train a SINGLE repair model on data from ALL scenes."""
+def train_repair_model(cfg: RI3DConfig, shared_components=None):
+    """Train a per-scene repair model on this scene's leave-one-out data.
+
+    Args:
+        cfg: scene config
+        shared_components: optional dict with pre-loaded frozen SD components
+            (vae, unet, text_embeds, noise_scheduler) to avoid reloading per scene
+    """
     from diffusers import (
         ControlNetModel,
         DDPMScheduler,
@@ -178,44 +181,47 @@ def train_repair_model(cfg: RI3DConfig):
     from transformers import CLIPTextModel, CLIPTokenizer
     from peft import LoraConfig, get_peft_model
 
-    model_dir = cfg.shared_model_dir() / "repair_model"
+    model_dir = cfg.scene_output_dir() / "repair_model"
     model_dir.mkdir(parents=True, exist_ok=True)
 
     device = cfg.device
     dtype = cfg.dtype
 
-    # Collect training pairs from ALL scenes
-    all_pairs = []
-    scenes = cfg.list_scenes()
-    for scene_dir in scenes:
-        scene_cfg = RI3DConfig(scene_dir=scene_dir, output_dir=cfg.output_dir)
-        pairs_path = scene_cfg.scene_output_dir() / "repair_training_data" / "training_pairs.pt"
-        if pairs_path.exists():
-            pairs = torch.load(pairs_path, weights_only=False)
-            all_pairs.extend(pairs)
-            print(f"  Loaded {len(pairs)} pairs from {scene_dir.name}")
-
+    # Load this scene's training pairs
+    pairs_path = cfg.scene_output_dir() / "repair_training_data" / "training_pairs.pt"
+    all_pairs = torch.load(pairs_path, weights_only=False)
     if len(all_pairs) == 0:
-        raise RuntimeError("No training pairs found. Run data generation first.")
-    print(f"Total training pairs across all scenes: {len(all_pairs)}")
+        raise RuntimeError(f"No training pairs for {cfg.scene_name}. Run data generation first.")
+    print(f"Training pairs for {cfg.scene_name}: {len(all_pairs)}")
 
-    # Load models
-    print("Loading SD 1.5 + ControlNet tile...")
-    tokenizer = CLIPTokenizer.from_pretrained(cfg.sd_model, subfolder="tokenizer")
-    text_encoder = CLIPTextModel.from_pretrained(cfg.sd_model, subfolder="text_encoder",
-                                                  torch_dtype=dtype).to(device)
-    vae = AutoencoderKL.from_pretrained(cfg.sd_model, subfolder="vae",
-                                         torch_dtype=dtype).to(device)
-    unet = UNet2DConditionModel.from_pretrained(cfg.sd_model, subfolder="unet",
-                                                 torch_dtype=dtype).to(device)
+    # Use shared frozen components if provided, otherwise load our own
+    _owns_components = shared_components is None
+    if _owns_components:
+        print("Loading SD 1.5 + ControlNet tile...")
+        tokenizer = CLIPTokenizer.from_pretrained(cfg.sd_model, subfolder="tokenizer")
+        text_encoder = CLIPTextModel.from_pretrained(cfg.sd_model, subfolder="text_encoder",
+                                                      torch_dtype=dtype).to(device)
+        vae = AutoencoderKL.from_pretrained(cfg.sd_model, subfolder="vae",
+                                             torch_dtype=dtype).to(device)
+        unet = UNet2DConditionModel.from_pretrained(cfg.sd_model, subfolder="unet",
+                                                     torch_dtype=dtype).to(device)
+        noise_scheduler = DDPMScheduler.from_pretrained(cfg.sd_model, subfolder="scheduler")
+        text_encoder.requires_grad_(False)
+        vae.requires_grad_(False)
+        unet.requires_grad_(False)
+        with torch.no_grad():
+            tokens = tokenizer("", padding="max_length", max_length=77,
+                               return_tensors="pt").input_ids.to(device)
+            text_embeds = text_encoder(tokens)[0]
+    else:
+        vae = shared_components["vae"]
+        unet = shared_components["unet"]
+        text_embeds = shared_components["text_embeds"]
+        noise_scheduler = shared_components["noise_scheduler"]
+
+    # Fresh ControlNet + LoRA for this scene
     controlnet = ControlNetModel.from_pretrained(cfg.controlnet_model,
                                                   torch_dtype=dtype).to(device)
-    noise_scheduler = DDPMScheduler.from_pretrained(cfg.sd_model, subfolder="scheduler")
-
-    text_encoder.requires_grad_(False)
-    vae.requires_grad_(False)
-    unet.requires_grad_(False)
-
     lora_config = LoraConfig(
         r=cfg.repair_lora_rank,
         lora_alpha=cfg.repair_lora_rank,
@@ -227,17 +233,11 @@ def train_repair_model(cfg: RI3DConfig):
 
     optimizer = torch.optim.AdamW(controlnet.parameters(), lr=cfg.repair_lr, weight_decay=1e-2)
 
-    with torch.no_grad():
-        tokens = tokenizer("", padding="max_length", max_length=77,
-                           return_tensors="pt").input_ids.to(device)
-        text_embeds = text_encoder(tokens)[0]
-
-    # Scale iterations by number of scenes (more data = more iters)
-    n_iters = max(cfg.repair_train_iters, cfg.repair_train_iters * len(scenes) // 2)
+    n_iters = cfg.repair_train_iters
     print(f"Training ControlNet LoRA for {n_iters} iterations on {len(all_pairs)} pairs...")
     losses = []
 
-    for step in tqdm(range(n_iters), desc="Repair training"):
+    for step in tqdm(range(n_iters), desc=f"Repair [{cfg.scene_name}]"):
         corrupted, clean = random.choice(all_pairs)
 
         corrupted_512 = F.interpolate(
@@ -283,17 +283,19 @@ def train_repair_model(cfg: RI3DConfig):
             print(f"  Step {step+1}: loss = {avg_loss:.6f}")
 
     controlnet.save_pretrained(model_dir)
-    print(f"Saved shared repair model to {model_dir}")
+    print(f"Saved repair model to {model_dir}")
 
     fig, ax = plt.subplots(figsize=(10, 4))
     ax.plot(losses)
     ax.set_xlabel("Step")
     ax.set_ylabel("Loss")
-    ax.set_title("Repair Model Training Loss (all scenes)")
+    ax.set_title(f"Repair Model Training Loss — {cfg.scene_name}")
     fig.savefig(model_dir / "training_loss.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
 
-    del text_encoder, vae, unet, controlnet, optimizer
+    del controlnet, optimizer
+    if _owns_components:
+        del text_encoder, vae, unet
     torch.cuda.empty_cache()
 
 
@@ -319,7 +321,7 @@ def test_repair_model(cfg: RI3DConfig):
         return
     pairs = torch.load(pairs_path, weights_only=False)
 
-    model_dir = cfg.shared_model_dir() / "repair_model"
+    model_dir = cfg.scene_output_dir() / "repair_model"
     print("Loading repair pipeline for test...")
     controlnet = ControlNetModel.from_pretrained(cfg.controlnet_model, torch_dtype=dtype)
     controlnet = PeftModel.from_pretrained(controlnet, model_dir)
@@ -374,10 +376,11 @@ def test_repair_model(cfg: RI3DConfig):
     print(f"Saved repair test results to {test_dir}")
 
 
-def run_step5(cfg: RI3DConfig):
-    """Full step 5: generate data for all scenes, train shared model, test on this scene."""
-    generate_all_scenes_data(cfg)
-    train_repair_model(cfg)
+def run_step5(cfg: RI3DConfig, shared_components=None):
+    """Full step 5 for a single scene: generate data, train, test."""
+    if not (cfg.scene_output_dir() / "repair_training_data" / "training_pairs.pt").exists():
+        generate_leave_one_out_data(cfg)
+    train_repair_model(cfg, shared_components=shared_components)
     test_repair_model(cfg)
 
 
