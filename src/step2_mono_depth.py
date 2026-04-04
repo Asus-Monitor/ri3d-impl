@@ -26,8 +26,8 @@ def save_depth_vis(depth: np.ndarray, path: Path, title: str = ""):
     plt.close(fig)
 
 
-def run_mono_depth(cfg: RI3DConfig):
-    from transformers import pipeline
+def run_mono_depth(cfg: RI3DConfig, depth_pipe=None):
+    from transformers import pipeline as hf_pipeline
 
     out_dir = cfg.scene_output_dir()
     mono_dir = out_dir / "mono_depths"
@@ -37,15 +37,17 @@ def run_mono_depth(cfg: RI3DConfig):
     image_paths = torch.load(out_dir / "image_paths.pt", weights_only=False)
     n_images = len(image_paths)
 
-    # Load depth estimation pipeline
-    print(f"Loading Depth Anything V2 Small...")
-    depth_pipe = pipeline(
-        "depth-estimation",
-        model=cfg.depth_model,
-        device=cfg.device,
-        torch_dtype=cfg.dtype,
-    )
-    print("Model loaded.")
+    # Load depth estimation pipeline if not provided externally
+    _owns_pipe = depth_pipe is None
+    if _owns_pipe:
+        print(f"Loading Depth Anything V2 Small...")
+        depth_pipe = hf_pipeline(
+            "depth-estimation",
+            model=cfg.depth_model,
+            device=cfg.device,
+            torch_dtype=cfg.dtype,
+        )
+        print("Model loaded.")
 
     # Also load the DUSt3R depth resolution for reference
     dust3r_depth_0 = torch.load(out_dir / "dust3r_depths" / "depth_000.pt", weights_only=True)
@@ -83,8 +85,9 @@ def run_mono_depth(cfg: RI3DConfig):
 
         print(f"    Depth range: [{depth_np.min():.3f}, {depth_np.max():.3f}]")
 
-    # Cleanup
-    del depth_pipe
+    # Cleanup only if we loaded it ourselves
+    if _owns_pipe:
+        del depth_pipe
     torch.cuda.empty_cache()
 
     print(f"\nStep 2 complete! Mono depth maps in {mono_dir}")

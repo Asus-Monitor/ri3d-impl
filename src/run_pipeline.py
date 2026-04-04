@@ -22,6 +22,19 @@ from pathlib import Path
 from config import RI3DConfig
 
 
+def _build_scene_cfgs(cfg: RI3DConfig) -> list[RI3DConfig]:
+    """Build per-scene configs for all scenes in the dataset."""
+    scenes = cfg.list_scenes()
+    return [
+        RI3DConfig(
+            scene_dir=scene_dir, dataset_dir=cfg.dataset_dir,
+            output_dir=cfg.output_dir, n_views=cfg.n_views,
+            device=cfg.device, dtype=cfg.dtype,
+        )
+        for scene_dir in scenes
+    ]
+
+
 def run_prep_scene(cfg: RI3DConfig):
     """Run steps 1-4 for a single scene."""
     from step1_dust3r import run_dust3r
@@ -47,21 +60,102 @@ def run_prep_scene(cfg: RI3DConfig):
 
 
 def run_prep_all_scenes(cfg: RI3DConfig):
-    """Run steps 1-4 for ALL scenes in the dataset."""
-    scenes = cfg.list_scenes()
-    print(f"Preparing {len(scenes)} scenes...")
+    """Run steps 1-4 for ALL scenes, batched by step to avoid model reload.
 
-    for scene_dir in scenes:
-        scene_cfg = RI3DConfig(
-            scene_dir=scene_dir, dataset_dir=cfg.dataset_dir,
-            output_dir=cfg.output_dir, n_views=cfg.n_views,
-            device=cfg.device, dtype=cfg.dtype,
+    Instead of processing each scene through all 4 steps before moving on,
+    we load each heavy model once and run it across all scenes:
+      1. Load DUSt3R → run step 1 for all scenes → unload
+      2. Load DepthAnything → run step 2 for all scenes → unload
+      3. Run step 3 for all scenes (CPU, no model)
+      4. Run step 4 for all scenes (gsplat, lightweight)
+    """
+    import torch
+    from step1_dust3r import run_dust3r
+    from step2_mono_depth import run_mono_depth
+    from step3_depth_fusion import run_depth_fusion
+    from step4_gaussian_init import run_step4
+
+    scene_cfgs = _build_scene_cfgs(cfg)
+    print(f"Preparing {len(scene_cfgs)} scenes (batched by step)...")
+
+    # Track which scenes are fully done (already have init_gaussians.pt)
+    done = set()
+    for sc in scene_cfgs:
+        if (sc.scene_output_dir() / "init_gaussians.pt").exists():
+            done.add(sc.scene_name)
+            print(f"  Skipping {sc.scene_name}: already prepared")
+    remaining = [sc for sc in scene_cfgs if sc.scene_name not in done]
+    if not remaining:
+        print("All scenes already prepared.")
+        return
+
+    # --- Step 1: DUSt3R (load model once) ---
+    # Find scenes that still need step 1
+    need_step1 = [sc for sc in remaining
+                  if not (sc.scene_output_dir() / "dust3r_poses.pt").exists()]
+    if need_step1:
+        print(f"\n{'='*60}")
+        print(f"  Step 1: DUSt3R — {len(need_step1)} scenes")
+        print(f"{'='*60}")
+        from dust3r.model import AsymmetricCroCo3DStereo
+        model = AsymmetricCroCo3DStereo.from_pretrained(cfg.dust3r_model).to(cfg.device)
+        for sc in need_step1:
+            print(f"\n--- {sc.scene_name} ---")
+            run_dust3r(sc, model=model)
+        del model
+        torch.cuda.empty_cache()
+    else:
+        print("Step 1: all scenes already done.")
+
+    # --- Step 2: Monocular Depth (load pipeline once) ---
+    need_step2 = [sc for sc in remaining
+                  if not (sc.scene_output_dir() / "mono_depths").exists()
+                  or not any((sc.scene_output_dir() / "mono_depths").iterdir())]
+    if need_step2:
+        print(f"\n{'='*60}")
+        print(f"  Step 2: Monocular Depth — {len(need_step2)} scenes")
+        print(f"{'='*60}")
+        from transformers import pipeline as hf_pipeline
+        depth_pipe = hf_pipeline(
+            "depth-estimation",
+            model=cfg.depth_model,
+            device=cfg.device,
+            torch_dtype=cfg.dtype,
         )
-        # Skip if already done
-        if (scene_cfg.scene_output_dir() / "init_gaussians.pt").exists():
-            print(f"  Skipping {scene_dir.name}: already prepared")
-            continue
-        run_prep_scene(scene_cfg)
+        for sc in need_step2:
+            print(f"\n--- {sc.scene_name} ---")
+            run_mono_depth(sc, depth_pipe=depth_pipe)
+        del depth_pipe
+        torch.cuda.empty_cache()
+    else:
+        print("Step 2: all scenes already done.")
+
+    # --- Step 3: Depth Fusion (CPU, no heavy model) ---
+    need_step3 = [sc for sc in remaining
+                  if not (sc.scene_output_dir() / "fused_depths").exists()
+                  or not any((sc.scene_output_dir() / "fused_depths").iterdir())]
+    if need_step3:
+        print(f"\n{'='*60}")
+        print(f"  Step 3: Depth Fusion — {len(need_step3)} scenes")
+        print(f"{'='*60}")
+        for sc in need_step3:
+            print(f"\n--- {sc.scene_name} ---")
+            run_depth_fusion(sc)
+    else:
+        print("Step 3: all scenes already done.")
+
+    # --- Step 4: Gaussian Init (gsplat rendering) ---
+    need_step4 = [sc for sc in remaining
+                  if not (sc.scene_output_dir() / "init_gaussians.pt").exists()]
+    if need_step4:
+        print(f"\n{'='*60}")
+        print(f"  Step 4: Gaussian Init — {len(need_step4)} scenes")
+        print(f"{'='*60}")
+        for sc in need_step4:
+            print(f"\n--- {sc.scene_name} ---")
+            run_step4(sc)
+    else:
+        print("Step 4: all scenes already done.")
 
 
 def run_train_models(cfg: RI3DConfig):

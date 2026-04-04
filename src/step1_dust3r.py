@@ -262,7 +262,7 @@ def print_quality_report(quality: dict, image_paths: list[str], poses):
     print(f"{'='*60}\n")
 
 
-def run_dust3r(cfg: RI3DConfig):
+def run_dust3r(cfg: RI3DConfig, model=None):
     from dust3r.model import AsymmetricCroCo3DStereo
     from dust3r.utils.image import load_images
     from dust3r.image_pairs import make_pairs
@@ -279,11 +279,13 @@ def run_dust3r(cfg: RI3DConfig):
     all_image_paths = load_scene_images(cfg.scene_dir)
     image_paths = select_views(all_image_paths, cfg.n_views, cfg.scene_dir)
     n_images = len(image_paths)
-    print(f"Loading DUSt3R model...")
 
-    # Load model
-    model = AsymmetricCroCo3DStereo.from_pretrained(cfg.dust3r_model)
-    model = model.to(cfg.device)
+    # Load model if not provided externally
+    _owns_model = model is None
+    if _owns_model:
+        print(f"Loading DUSt3R model...")
+        model = AsymmetricCroCo3DStereo.from_pretrained(cfg.dust3r_model)
+        model = model.to(cfg.device)
 
     # Load images at 512 resolution
     images = load_images(image_paths, size=512)
@@ -384,8 +386,10 @@ def run_dust3r(cfg: RI3DConfig):
         fx = intrinsics[i, 0, 0].item()
         print(f"  Cam {i}: pos=({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f}), fx={fx:.1f}")
 
-    # Free model VRAM
-    del model, scene
+    # Free model VRAM only if we loaded it ourselves
+    del scene
+    if _owns_model:
+        del model
     torch.cuda.empty_cache()
 
     print(f"\nStep 1 complete! Outputs in {out_dir}")
