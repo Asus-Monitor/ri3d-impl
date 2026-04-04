@@ -10,8 +10,8 @@ class RI3DConfig:
     dataset_dir: Path = Path("dataset")  # parent dir with all scene subdirs
     output_dir: Path = Path("outputs")
 
-    # View selection
-    n_views: int = 3  # number of input views to select from each scene
+    # View selection (int for count, or comma-separated filenames)
+    n_views: int | str = 3
 
     # Device
     device: str = "cuda"

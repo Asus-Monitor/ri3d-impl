@@ -32,12 +32,36 @@ def load_scene_images(scene_dir: Path) -> list[str]:
     return [str(p) for p in paths]
 
 
-def select_views(image_paths: list[str], n_views: int) -> list[str]:
-    """Select n_views well-spaced images from the full set.
+def select_views(image_paths: list[str], n_views, scene_dir: Path = None) -> list[str]:
+    """Select views from the full set.
 
-    If there are more images than n_views, evenly sample.
-    If there are exactly n_views or fewer, return all.
+    n_views can be:
+      - int: evenly sample that many views
+      - str of comma-separated filenames: use those specific files
+        e.g. "DSC_001.jpg,DSC_005.jpg,DSC_010.jpg"
     """
+    if isinstance(n_views, str) and not n_views.isdigit():
+        # Comma-separated filenames
+        names = [s.strip() for s in n_views.split(",") if s.strip()]
+        selected = []
+        available = {Path(p).name: p for p in image_paths}
+        for name in names:
+            if name in available:
+                selected.append(available[name])
+            else:
+                # Try matching without extension
+                stem = Path(name).stem
+                matches = [p for p in image_paths if Path(p).stem == stem]
+                if matches:
+                    selected.append(matches[0])
+                else:
+                    raise FileNotFoundError(
+                        f"View '{name}' not found in {list(available.keys())}"
+                    )
+        print(f"Selected {len(selected)} specific views: {[Path(p).name for p in selected]}")
+        return selected
+
+    n_views = int(n_views)
     n = len(image_paths)
     if n <= n_views:
         print(f"Using all {n} images (requested {n_views})")
@@ -89,6 +113,135 @@ def save_pointcloud_ply(path: Path, points: np.ndarray, colors: np.ndarray):
             f.write(f"{x:.6f} {y:.6f} {z:.6f} {int(r)} {int(g)} {int(b)}\n")
 
 
+def compute_triangulation_quality(poses, conf_masks):
+    """Compute a triangulation quality score for the input views.
+
+    Returns a dict with per-pair and overall metrics:
+      - baselines: pairwise camera distances
+      - angular_divs: pairwise angular differences between viewing directions
+      - confidence_coverage: fraction of high-confidence pixels per view
+      - score: overall quality 0-100 (higher = better triangulation)
+
+    Scoring:
+      - Baseline diversity: wider spread of camera positions is better
+      - Angular diversity: more varied viewing angles give better triangulation
+      - Confidence: higher DUSt3R confidence means more reliable depth
+    """
+    n = len(poses)
+    positions = poses[:, :3, 3]
+    forwards = poses[:, :3, 2]
+
+    baselines = []
+    angular_divs = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            bl = (positions[i] - positions[j]).norm().item()
+            baselines.append(bl)
+            cos_a = (forwards[i] @ forwards[j]).item()
+            ang = np.degrees(np.arccos(np.clip(cos_a, -1, 1)))
+            angular_divs.append(ang)
+
+    conf_coverages = []
+    for mask in conf_masks:
+        mask_np = mask.detach().cpu().numpy() if torch.is_tensor(mask) else mask
+        conf_coverages.append(mask_np.sum() / mask_np.size)
+
+    # --- Score components (each 0-1) ---
+
+    # Baseline score: ratio of min to max baseline
+    # Perfect = 1.0 (all baselines equal), bad = 0.0 (one pair nearly co-located)
+    bl_arr = np.array(baselines)
+    if bl_arr.max() > 1e-8:
+        baseline_score = bl_arr.min() / bl_arr.max()
+    else:
+        baseline_score = 0.0
+
+    # Angular diversity score: want angles spread between 30-120 degrees
+    # Too small (<15°) = nearly same view, too large (>150°) = opposing views
+    ang_arr = np.array(angular_divs)
+    ang_scores = []
+    for a in ang_arr:
+        if a < 15:
+            ang_scores.append(a / 15.0 * 0.3)  # very poor
+        elif a < 30:
+            ang_scores.append(0.3 + (a - 15) / 15.0 * 0.4)
+        elif a <= 120:
+            ang_scores.append(0.7 + 0.3 * (1.0 - abs(a - 75) / 45.0))  # peak at 75°
+        elif a <= 150:
+            ang_scores.append(0.7 - (a - 120) / 30.0 * 0.3)
+        else:
+            ang_scores.append(0.4)  # opposing views still usable
+    angular_score = np.mean(ang_scores)
+
+    # Confidence score: average coverage
+    conf_score = np.mean(conf_coverages)
+
+    # Overall: weighted combination
+    overall = 0.35 * baseline_score + 0.45 * angular_score + 0.20 * conf_score
+    score = int(round(overall * 100))
+
+    return {
+        "baselines": baselines,
+        "angular_divs": angular_divs,
+        "confidence_coverages": conf_coverages,
+        "baseline_score": baseline_score,
+        "angular_score": angular_score,
+        "confidence_score": conf_score,
+        "score": score,
+    }
+
+
+def print_quality_report(quality: dict, image_paths: list[str], poses):
+    """Print a human-readable triangulation quality report."""
+    n = len(image_paths)
+    names = [Path(p).stem for p in image_paths]
+
+    print(f"\n{'='*60}")
+    print(f"  TRIANGULATION QUALITY REPORT")
+    print(f"{'='*60}")
+
+    # Pairwise metrics
+    idx = 0
+    print(f"\n  Pairwise baselines and angular differences:")
+    for i in range(n):
+        for j in range(i + 1, n):
+            bl = quality["baselines"][idx]
+            ang = quality["angular_divs"][idx]
+            status = ""
+            if ang < 15:
+                status = " << POOR: nearly identical views"
+            elif bl < 0.05:
+                status = " << POOR: cameras too close"
+            elif ang > 150:
+                status = " (opposing views)"
+            print(f"    {names[i]} <-> {names[j]}: "
+                  f"baseline={bl:.4f}, angle={ang:.1f}°{status}")
+            idx += 1
+
+    # Per-view confidence
+    print(f"\n  Per-view DUSt3R confidence coverage:")
+    for i in range(n):
+        cov = quality["confidence_coverages"][i] * 100
+        print(f"    {names[i]}: {cov:.1f}%")
+
+    # Component scores
+    print(f"\n  Score breakdown:")
+    print(f"    Baseline diversity:  {quality['baseline_score']*100:.0f}/100")
+    print(f"    Angular diversity:   {quality['angular_score']*100:.0f}/100")
+    print(f"    Confidence coverage: {quality['confidence_score']*100:.0f}/100")
+
+    score = quality["score"]
+    if score >= 70:
+        grade = "GOOD"
+    elif score >= 45:
+        grade = "FAIR"
+    else:
+        grade = "POOR — consider choosing different input views"
+
+    print(f"\n  Overall triangulation quality: {score}/100 ({grade})")
+    print(f"{'='*60}\n")
+
+
 def run_dust3r(cfg: RI3DConfig):
     from dust3r.model import AsymmetricCroCo3DStereo
     from dust3r.utils.image import load_images
@@ -102,9 +255,9 @@ def run_dust3r(cfg: RI3DConfig):
     depth_dir.mkdir(parents=True, exist_ok=True)
     conf_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load images and select N views
+    # Load images and select views
     all_image_paths = load_scene_images(cfg.scene_dir)
-    image_paths = select_views(all_image_paths, cfg.n_views)
+    image_paths = select_views(all_image_paths, cfg.n_views, cfg.scene_dir)
     n_images = len(image_paths)
     print(f"Loading DUSt3R model...")
 
@@ -131,7 +284,7 @@ def run_dust3r(cfg: RI3DConfig):
 
     if n_images > 2:
         loss = scene.compute_global_alignment(
-            init="mst", niter=300, schedule="cosine", lr=0.01
+            init="mst", niter=512, schedule="cosine", lr=0.01
         )
         print(f"Global alignment loss: {loss:.4f}")
 
@@ -151,6 +304,10 @@ def run_dust3r(cfg: RI3DConfig):
 
     # Save image paths for later reference
     torch.save(image_paths, out_dir / "image_paths.pt")
+
+    # Triangulation quality report
+    quality = compute_triangulation_quality(poses, conf_masks)
+    print_quality_report(quality, image_paths, poses)
 
     # Save per-view depth, confidence, and visualizations
     all_pts = []
@@ -216,6 +373,7 @@ def run_dust3r(cfg: RI3DConfig):
         "poses": poses,
         "intrinsics": intrinsics,
         "image_paths": image_paths,
+        "quality": quality,
     }
 
 
@@ -223,7 +381,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Step 1: DUSt3R camera + depth estimation")
     parser.add_argument("--scene", type=str, required=True, help="Path to scene image directory")
     parser.add_argument("--output", type=str, default="outputs", help="Output directory")
-    parser.add_argument("--n_views", type=int, default=3, help="Number of input views to select")
+    parser.add_argument("--n_views", type=str, default="3",
+                        help="Number of views to select (int), or comma-separated "
+                             "filenames e.g. 'DSC_001.jpg,DSC_005.jpg,DSC_010.jpg'")
     args = parser.parse_args()
 
     cfg = RI3DConfig(scene_dir=Path(args.scene), output_dir=Path(args.output),
