@@ -208,22 +208,19 @@ def run_stage1(cfg: RI3DConfig):
                         r["depth"].squeeze(-1), cfg
                     ).to(device)
 
-            # Save example renders at every refresh
-            for j in range(min(3, cfg.stage1_num_novel_views)):
-                fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-                with torch.no_grad():
-                    w2c = torch.linalg.inv(novel_c2w[j])
-                    r = model.render(w2c, K_avg, H, W)
-                axes[0].imshow(r["image"].clamp(0,1).cpu().numpy())
-                axes[0].set_title(f"Rendered (step {step})")
-                axes[1].imshow(pseudo_gt[j].cpu().numpy())
-                axes[1].set_title("Pseudo GT (repaired)")
-                axes[2].imshow(r["alpha"].squeeze(-1).cpu().numpy(), cmap="gray")
-                axes[2].set_title("Alpha")
-                for ax in axes: ax.axis("off")
-                fig.savefig(render_dir / f"step{step:05d}_novel{j}.png",
-                            dpi=120, bbox_inches="tight")
-                plt.close(fig)
+                    # Save example renders (reuse already-rendered data, no extra render)
+                    if j < 3:
+                        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+                        axes[0].imshow(r["image"].clamp(0,1).cpu().numpy())
+                        axes[0].set_title(f"Rendered (step {step})")
+                        axes[1].imshow(pseudo_gt[j].cpu().numpy())
+                        axes[1].set_title("Pseudo GT (repaired)")
+                        axes[2].imshow(r["alpha"].squeeze(-1).cpu().numpy(), cmap="gray")
+                        axes[2].set_title("Alpha")
+                        for ax in axes: ax.axis("off")
+                        fig.savefig(render_dir / f"step{step:05d}_novel{j}.png",
+                                    dpi=120, bbox_inches="tight")
+                        plt.close(fig)
 
         total_loss = torch.tensor(0.0, device=device)
 

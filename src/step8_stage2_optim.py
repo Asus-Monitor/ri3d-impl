@@ -3,7 +3,7 @@
 Per the paper (Sec 4.3, Stage 2):
   1. Select K non-overlapping novel views with missing regions
   2. Inpaint missing areas using personalized inpainting model
-  3. Project inpainted content into 3D using monocular depth + Poisson fusion
+  3. Project inpainted content into 3D using monocular depth + alignment
   4. Continue optimization with repair model on all novel views
   5. Repeat inpaint-optimize cycle until missing areas are filled
 
@@ -54,7 +54,7 @@ def load_inpainting_pipeline(cfg: RI3DConfig):
     ).to(device)
 
     pipe.unet = PeftModel.from_pretrained(pipe.unet, model_dir)
-    pipe.unet = pipe.unet.merge_and_unload()  # merge scene LoRA before adding LCM LoRA
+    pipe.unet = pipe.unet.merge_and_unload()
     pipe.scheduler = LCMScheduler.from_config(pipe.scheduler.config)
     pipe.load_lora_weights(cfg.lcm_lora, adapter_name="lcm")
     pipe.safety_checker = None
@@ -76,15 +76,11 @@ def inpaint_missing_regions(pipe, rendered_image: torch.Tensor,
         inpainted: (H, W, 3) image with missing regions filled
     """
     H, W = rendered_image.shape[:2]
+    missing = ((1 - alpha_mask) * bg_mask)
 
-    # Missing mask: not visible AND background
-    missing = ((1 - alpha_mask) * bg_mask)  # (H, W)
-
-    # If nothing to inpaint, return original
     if missing.sum() < 100:
         return rendered_image.clone()
 
-    # Convert to PIL
     img_np = (rendered_image.clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
     mask_np = (missing.cpu().numpy() * 255).astype(np.uint8)
 
@@ -100,7 +96,6 @@ def inpaint_missing_regions(pipe, rendered_image: torch.Tensor,
             guidance_scale=cfg.lcm_guidance_scale,
         ).images[0]
 
-    # Back to tensor at original resolution
     result_np = np.array(result.resize((W, H), Image.LANCZOS)).astype(np.float32) / 255.0
     inpainted = torch.from_numpy(result_np).to(rendered_image.device)
 
@@ -111,82 +106,128 @@ def inpaint_missing_regions(pipe, rendered_image: torch.Tensor,
     return composite
 
 
-def project_inpainted_to_3d(inpainted_image: torch.Tensor, missing_mask: torch.Tensor,
-                              rendered_depth: torch.Tensor, c2w: torch.Tensor,
-                              K: torch.Tensor, cfg: RI3DConfig) -> dict:
-    """Project inpainted pixels into 3D as new Gaussians.
+def estimate_mono_depth(image_tensor: torch.Tensor, cfg: RI3DConfig) -> torch.Tensor:
+    """Run monocular depth estimation on an image tensor.
 
-    Uses monocular depth from the inpainted image combined with rendered depth
-    via Poisson fusion (Eq. 2) to get metric depth for inpainted regions.
+    Args:
+        image_tensor: (H, W, 3) float tensor in [0, 1]
+    Returns:
+        depth: (H, W) float tensor
     """
     from transformers import pipeline as hf_pipeline
-    from step3_depth_fusion import align_mono_to_dust3r, solve_poisson_fusion_fast
 
+    H, W = image_tensor.shape[:2]
+    img_np = (image_tensor.clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
+    img_pil = Image.fromarray(img_np)
+
+    # Use cached pipeline
+    if not hasattr(estimate_mono_depth, "_pipe"):
+        estimate_mono_depth._pipe = hf_pipeline(
+            "depth-estimation", model=cfg.depth_model,
+            device=cfg.device, torch_dtype=cfg.dtype,
+        )
+    with torch.no_grad():
+        result = estimate_mono_depth._pipe(img_pil)
+
+    mono = result["predicted_depth"]
+    if mono.dim() == 3:
+        mono = mono.squeeze(0)
+    mono = F.interpolate(
+        mono.unsqueeze(0).unsqueeze(0).float(),
+        size=(H, W), mode="bilinear", align_corners=False,
+    ).squeeze()
+    return mono
+
+
+def clear_mono_depth_cache():
+    if hasattr(estimate_mono_depth, "_pipe"):
+        del estimate_mono_depth._pipe
+        torch.cuda.empty_cache()
+
+
+def project_inpainted_to_3d(inpainted_image: torch.Tensor, missing_mask: torch.Tensor,
+                              rendered_depth: torch.Tensor, c2w: torch.Tensor,
+                              K: torch.Tensor, cfg: RI3DConfig,
+                              max_new_gaussians: int = 3000) -> dict | None:
+    """Project inpainted pixels into 3D as new Gaussians.
+
+    Uses monocular depth aligned to rendered depth via simple linear fit
+    (fast alternative to full Poisson fusion for the refresh cycle).
+    Subsamples to max_new_gaussians to prevent unbounded growth.
+    """
     device = inpainted_image.device
     H, W = inpainted_image.shape[:2]
 
-    # Get monocular depth for inpainted image
-    img_np = (inpainted_image.clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
-    img_pil = Image.fromarray(img_np)
-
-    depth_pipe = hf_pipeline("depth-estimation", model=cfg.depth_model,
-                              device=cfg.device, torch_dtype=cfg.dtype)
-    result = depth_pipe(img_pil)
-    mono_depth = result["predicted_depth"]
-    if mono_depth.dim() == 3:
-        mono_depth = mono_depth.squeeze(0)
-    mono_depth = F.interpolate(
-        mono_depth.unsqueeze(0).unsqueeze(0).float(),
-        size=(H, W), mode="bilinear", align_corners=False
-    ).squeeze().cpu().numpy().astype(np.float64)
-
-    del depth_pipe
-    torch.cuda.empty_cache()
-
-    # Use rendered depth as reference, inpainted mask as low-confidence
-    rendered_d = rendered_depth.squeeze().cpu().numpy().astype(np.float64)
-    visible_mask = (1 - missing_mask.cpu().numpy()).astype(bool)  # where we have rendered depth
-
-    # Align mono to rendered depth scale
-    mono_aligned = align_mono_to_dust3r(mono_depth, rendered_d, visible_mask)
-
-    # Poisson fusion
-    fused = solve_poisson_fusion_fast(rendered_d, mono_aligned, visible_mask, cfg.poisson_lambda)
-    fused = torch.from_numpy(fused).float().to(device)
-
-    # Only get new Gaussians for missing pixels
-    mask_flat = missing_mask.reshape(-1) > 0.5
-    if mask_flat.sum() == 0:
+    # Skip if very few missing pixels
+    n_missing = (missing_mask > 0.5).sum().item()
+    if n_missing < 100:
         return None
 
-    # Unproject missing pixels (all on CPU to avoid device mismatch)
-    pts = unproject_depth(fused.cpu(), K.cpu(), c2w.cpu())  # (H*W, 3)
-    colors = inpainted_image.reshape(-1, 3).cpu()
+    # Monocular depth on inpainted image
+    mono_depth = estimate_mono_depth(inpainted_image, cfg)  # (H, W) on GPU
 
-    pts = pts[mask_flat.cpu()]
-    colors = colors[mask_flat.cpu()]
-    depths_valid = fused.reshape(-1).cpu()[mask_flat.cpu()]
+    # Align mono depth to rendered depth scale using visible (non-missing) pixels
+    visible = (missing_mask < 0.5)
+    rd = rendered_depth.squeeze()
 
-    # Compute scale
-    fx = K[0, 0].cpu().item()
+    # Simple linear alignment: mono_aligned = scale * mono + shift
+    # Fitted only on visible pixels where rendered depth is valid
+    valid = visible & (rd > 0.01)
+    if valid.sum() < 100:
+        return None
+
+    mono_valid = mono_depth[valid].float()
+    rd_valid = rd[valid].float()
+
+    # Least-squares: [mono, 1] @ [scale, shift] = rd
+    A = torch.stack([mono_valid, torch.ones_like(mono_valid)], dim=1)
+    result = torch.linalg.lstsq(A, rd_valid)
+    scale, shift = result.solution[0].item(), result.solution[1].item()
+
+    aligned_depth = (mono_depth.float() * scale + shift).clamp(min=0.01)
+
+    # Composite depth: use rendered depth where visible, aligned mono where missing
+    fused = torch.where(visible, rd, aligned_depth).to(device)
+
+    # Get missing pixel indices
+    mask_flat = missing_mask.reshape(-1) > 0.5
+    n_total = mask_flat.sum().item()
+    if n_total == 0:
+        return None
+
+    # Subsample if too many missing pixels
+    if n_total > max_new_gaussians:
+        indices = torch.where(mask_flat)[0]
+        perm = torch.randperm(n_total, device=device)[:max_new_gaussians]
+        subsample_mask = torch.zeros_like(mask_flat)
+        subsample_mask[indices[perm]] = True
+        mask_flat = subsample_mask
+
+    # Unproject on GPU
+    pts = unproject_depth(fused, K, c2w)
+    colors = inpainted_image.reshape(-1, 3)
+
+    pts = pts[mask_flat]
+    colors = colors[mask_flat]
+    depths_valid = fused.reshape(-1)[mask_flat]
+
+    # Scale from depth and focal length
+    fx = K[0, 0].item()
     pixel_sizes = depths_valid / fx * cfg.gaussian_scale_factor
     scales = pixel_sizes.unsqueeze(-1).expand(-1, 3)
 
-    # Initialize params
     n = pts.shape[0]
-    quats = torch.zeros(n, 4)
+    quats = torch.zeros(n, 4, device=device)
     quats[:, 0] = 1.0
-    opacities = torch.full((n,), 0.5)
+    opacities = torch.full((n,), 0.5, device=device)
 
-    new_gaussians = {
+    return {
         "means": pts,
         "scales": torch.log(scales.clamp(min=1e-8)),
         "quats": quats,
         "opacities": torch.logit(opacities.clamp(1e-4, 1 - 1e-4)),
         "colors": colors,
     }
-
-    return new_gaussians
 
 
 def add_gaussians_to_model(model: GaussianModel, new_gaussians: dict):
@@ -197,9 +238,34 @@ def add_gaussians_to_model(model: GaussianModel, new_gaussians: dict):
         new = new_gaussians[key].float().to(device)
         combined = torch.cat([old, new], dim=0)
         model.params[key] = torch.nn.Parameter(combined)
-
-    # Re-setup optimizers (needed after changing parameter sizes)
     return model
+
+
+def select_inpaint_views(renders_cache: dict, n_views: int, k_inpaint: int,
+                          last_inpainted: set) -> list[int]:
+    """Select K views with largest missing regions, rotating to avoid always picking same views.
+
+    Per paper: "different subset of K images" each cycle, non-overlapping content.
+    """
+    # Score each view by missing area, penalize recently inpainted views
+    scores = {}
+    for j in range(n_views):
+        rc = renders_cache[j]
+        alpha_mask = rc["alpha_mask"]
+        bg_mask = rc["bg_mask"]
+        missing = ((1 - alpha_mask) * bg_mask).sum().item()
+        # Penalize recently inpainted views to encourage rotation
+        if j in last_inpainted:
+            missing *= 0.3
+        scores[j] = missing
+
+    # Pick top K by missing area
+    ranked = sorted(scores.keys(), key=lambda j: scores[j], reverse=True)
+    selected = ranked[:k_inpaint]
+
+    # Only inpaint views that actually have significant missing regions
+    selected = [j for j in selected if scores[j] > 100]
+    return selected
 
 
 def run_stage2(cfg: RI3DConfig):
@@ -240,13 +306,14 @@ def run_stage2(cfg: RI3DConfig):
     cam_positions = poses[:, :3, 3]
     scene_scale = (cam_positions - cam_positions.mean(dim=0)).norm(dim=1).mean().item()
     scene_scale = max(scene_scale, 0.1)
+    print(f"  Scene scale: {scene_scale:.4f}")
     strategy, strategy_state = model.setup_strategy(cfg, scene_scale=scene_scale)
 
     # Loss functions
     ssim_fn = SSIMLoss().to(device)
     lpips_fn = LPIPSLoss(device)
 
-    # Generate novel cameras (scene center from camera look-at points, robust to outliers)
+    # Generate novel cameras
     from step4_gaussian_init import compute_scene_center
     scene_center = compute_scene_center(poses, stage1_ckpt["gaussians"]["means"].to(device))
     novel_c2w = generate_elliptical_cameras(poses, cfg.stage2_num_novel_views, scene_center).to(device)
@@ -256,17 +323,12 @@ def run_stage2(cfg: RI3DConfig):
     for j in range(cfg.stage2_num_novel_views):
         camera_weights[j] = compute_camera_distance_weight(novel_c2w[j], poses)
 
-    # Load pipelines
-    print("Loading repair pipeline for Stage 2...")
-    repair_pipe = load_repair_pipeline(cfg)
-    print("Loading inpainting pipeline for Stage 2...")
-    inpaint_pipe = load_inpainting_pipeline(cfg)
-
-    # Storage for pseudo GT and inpainted images
+    # Storage
     pseudo_gt = [None] * cfg.stage2_num_novel_views
     inpainted_images = [None] * cfg.stage2_num_novel_views
     inpaint_masks = [None] * cfg.stage2_num_novel_views
     cached_bg_masks = [None] * cfg.stage2_num_novel_views
+    last_inpainted = set()  # track which views were inpainted last cycle
 
     plateau = PlateauDetector(cfg.plateau_window, cfg.plateau_threshold, cfg.plateau_min_iters)
     losses_history = []
@@ -274,57 +336,99 @@ def run_stage2(cfg: RI3DConfig):
     print(f"\n=== Stage 2 Optimization ===")
     print(f"Max iters: {cfg.stage2_max_iters}")
     print(f"Novel views: {cfg.stage2_num_novel_views}, Inpaint views: {cfg.stage2_num_inpaint_views}")
+    print(f"Inpaint interval: {cfg.stage2_inpaint_interval}, cutoff: {cfg.stage2_inpaint_cutoff}")
 
     for step in tqdm(range(cfg.stage2_max_iters), desc="Stage 2"):
 
-        # Inpaint and refresh cycle
+        # === Refresh cycle ===
         if step % cfg.stage2_inpaint_interval == 0:
             print(f"\n  Refresh cycle at step {step}...")
 
             with torch.no_grad():
-                # Render all novel views
+                # Phase 1: Render all novel views (fast — just gsplat)
+                renders_cache = {}
                 for j in range(cfg.stage2_num_novel_views):
                     w2c = torch.linalg.inv(novel_c2w[j])
                     r = model.render(w2c, K_avg, H, W, return_depth=True)
-
                     alpha_mask = get_opacity_mask(r["alpha"])
-                    bg_mask = compute_background_mask(r["depth"].squeeze(-1).detach(),
-                                                      cfg.bg_mask_n_clusters)
+                    bg_mask = compute_background_mask(
+                        r["depth"].squeeze(-1).detach(), cfg.bg_mask_n_clusters
+                    )
                     cached_bg_masks[j] = bg_mask.to(device)
+                    renders_cache[j] = {
+                        "image": r["image"].detach(),
+                        "depth": r["depth"].detach(),
+                        "alpha": r["alpha"].detach(),
+                        "alpha_mask": alpha_mask,
+                        "bg_mask": bg_mask,
+                    }
 
-                    # Inpaint K views (every other view) if before cutoff
-                    is_inpaint_view = (step < cfg.stage2_inpaint_cutoff and j % 2 == 0)
-                    if is_inpaint_view:
-                        inpainted = inpaint_missing_regions(
-                            inpaint_pipe, r["image"], alpha_mask, bg_mask, cfg
-                        )
-                        inpainted_images[j] = inpainted.detach()
-                        inpaint_masks[j] = ((1 - alpha_mask) * bg_mask).detach()
+                # Phase 2: Inpaint selected views (before cutoff)
+                do_inpaint = step < cfg.stage2_inpaint_cutoff
+                if do_inpaint:
+                    # Select K views with most missing content, rotating subsets
+                    inpaint_views = select_inpaint_views(
+                        renders_cache, cfg.stage2_num_novel_views,
+                        cfg.stage2_num_inpaint_views, last_inpainted,
+                    )
+                    last_inpainted = set(inpaint_views)
 
-                        # Project inpainted content into 3D
-                        new_gs = project_inpainted_to_3d(
-                            inpainted, inpaint_masks[j],
-                            r["depth"], novel_c2w[j], K_avg, cfg
-                        )
-                        if new_gs is not None:
-                            n_before = model.n_gaussians
-                            add_gaussians_to_model(model, new_gs)
-                            optimizers = model.setup_optimizers(cfg)
-                            strategy, strategy_state = model.setup_strategy(cfg, scene_scale=1.0)
-                            print(f"    View {j}: added {model.n_gaussians - n_before} Gaussians "
-                                  f"(total: {model.n_gaussians})")
+                    if inpaint_views:
+                        # Load inpaint pipeline on first use
+                        if not hasattr(run_stage2, "_inpaint_pipe"):
+                            print("  Loading inpainting pipeline...")
+                            run_stage2._inpaint_pipe = load_inpainting_pipeline(cfg)
+                        inpaint_pipe = run_stage2._inpaint_pipe
 
-                    # Pseudo GT: repair the INPAINTED image for inpainted views,
-                    # or repair the raw render for non-inpainted views.
-                    # Per paper: "We then apply our repair model to these [inpainted]
-                    # images, as well as the remaining M-K novel view images"
-                    if is_inpaint_view and inpainted_images[j] is not None:
+                        for j in inpaint_views:
+                            rc = renders_cache[j]
+                            inpainted = inpaint_missing_regions(
+                                inpaint_pipe, rc["image"], rc["alpha_mask"],
+                                rc["bg_mask"], cfg,
+                            )
+                            inpainted_images[j] = inpainted.detach()
+                            inpaint_masks[j] = ((1 - rc["alpha_mask"]) * rc["bg_mask"]).detach()
+
+                            # Project into 3D (subsampled, fast linear alignment)
+                            new_gs = project_inpainted_to_3d(
+                                inpainted, inpaint_masks[j],
+                                rc["depth"], novel_c2w[j], K_avg, cfg,
+                            )
+                            if new_gs is not None:
+                                n_before = model.n_gaussians
+                                add_gaussians_to_model(model, new_gs)
+                                optimizers = model.setup_optimizers(cfg)
+                                strategy, strategy_state = model.setup_strategy(
+                                    cfg, scene_scale=scene_scale,
+                                )
+                                print(f"    View {j}: +{model.n_gaussians - n_before} "
+                                      f"Gaussians (total: {model.n_gaussians})")
+                else:
+                    # Past cutoff — free inpaint + depth models
+                    if hasattr(run_stage2, "_inpaint_pipe"):
+                        del run_stage2._inpaint_pipe
+                        clear_mono_depth_cache()
+                        torch.cuda.empty_cache()
+                        print("  Freed inpainting + depth models (past cutoff)")
+
+                # Phase 3: Repair all novel views
+                if not hasattr(run_stage2, "_repair_pipe"):
+                    print("  Loading repair pipeline...")
+                    run_stage2._repair_pipe = load_repair_pipeline(cfg)
+                repair_pipe = run_stage2._repair_pipe
+
+                for j in range(cfg.stage2_num_novel_views):
+                    rc = renders_cache[j]
+                    # Repair inpainted image if available, otherwise raw render
+                    if inpainted_images[j] is not None:
                         repaired = repair_image(repair_pipe, inpainted_images[j], cfg)
                     else:
-                        repaired = repair_image(repair_pipe, r["image"], cfg)
+                        repaired = repair_image(repair_pipe, rc["image"], cfg)
                     pseudo_gt[j] = repaired.detach()
 
-            # Save examples
+                del renders_cache
+
+            # Save example renders (not every cycle — every 4th)
             if step % (cfg.stage2_inpaint_interval * 4) == 0:
                 for j in range(min(3, cfg.stage2_num_novel_views)):
                     with torch.no_grad():
@@ -354,7 +458,6 @@ def run_stage2(cfg: RI3DConfig):
         w2c_ref = torch.linalg.inv(poses[ref_idx])
         K_ref = intrinsics[ref_idx]
 
-        # Use LPIPS only every 10 steps (expensive SqueezeNet forward pass)
         use_lpips = (step % 10 == 0)
         lpips_fn_or_none = lpips_fn if use_lpips else None
 
@@ -374,19 +477,20 @@ def run_stage2(cfg: RI3DConfig):
             result_nov = model.render_for_loss(w2c_nov, K_avg, H, W)
             lambda_j = camera_weights[nov_idx]
 
-            # No visibility mask — enforce across entire image in Stage 2
             nov_loss = reconstruction_loss(
                 result_nov["image"], pseudo_gt[nov_idx],
                 ssim_fn, lpips_fn_or_none, cfg,
             )
             total_loss = total_loss + lambda_j * nov_loss
 
-            # Inpainting consistency loss (for inpainted views)
+            # Inpainting consistency loss: (1-M_α) ⊙ M_b ⊙ Lp (per paper)
             if inpainted_images[nov_idx] is not None and inpaint_masks[nov_idx] is not None:
-                inpaint_loss = F.l1_loss(
-                    result_nov["image"] * inpaint_masks[nov_idx].unsqueeze(-1),
-                    inpainted_images[nov_idx] * inpaint_masks[nov_idx].unsqueeze(-1),
-                )
+                mask_ip = inpaint_masks[nov_idx]
+                n_masked = mask_ip.sum().clamp(min=1)
+                mask_3ch = mask_ip.unsqueeze(-1)
+                inpaint_loss = (
+                    (result_nov["image"] - inpainted_images[nov_idx]).abs() * mask_3ch
+                ).sum() / (n_masked * 3)
                 total_loss = total_loss + 0.5 * inpaint_loss
 
         total_loss.backward()
@@ -418,8 +522,6 @@ def run_stage2(cfg: RI3DConfig):
     ckpt_path = ckpt_dir / "final_checkpoint.pt"
     torch.save(checkpoint, ckpt_path)
     print(f"Saved final checkpoint to {ckpt_path}")
-
-    # Also save Stage 2 specific checkpoint
     torch.save(checkpoint, out_dir / "stage2_checkpoint.pt")
 
     # Loss curve
@@ -449,7 +551,13 @@ def run_stage2(cfg: RI3DConfig):
             plt.imsave(render_dir / f"final_novel_{j:03d}.png", img)
             plt.imsave(render_dir / f"final_novel_{j:03d}_alpha.png", alpha, cmap="gray")
 
-    del repair_pipe, inpaint_pipe, model
+    # Cleanup
+    clear_mono_depth_cache()
+    if hasattr(run_stage2, "_repair_pipe"):
+        del run_stage2._repair_pipe
+    if hasattr(run_stage2, "_inpaint_pipe"):
+        del run_stage2._inpaint_pipe
+    del model
     torch.cuda.empty_cache()
 
     print(f"\nStage 2 complete! Final renders in {render_dir}")
