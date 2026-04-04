@@ -1,22 +1,38 @@
+# RI3D Implementation
 
-## dataset
+Implementation of [RI3D](https://people.engr.tamu.edu/nimak/Papers/RI3D/index.html) - state of the art few-shot gaussian splatting.
 
-wget LINK -O 360_v2.zip
+Makes a gaussian splat from very few images (down to 3). Existing solutions (COLMAP + postshot) look terrible with few cameras - holes, floaters, and they're picky about camera placement. COLMAP needs ~12 cameras minimum for a full body scan and still produces results that need manual cleanup.
+
+RI3D cleans up the floaters and inpaints holes with stable diffusion automatically. 
+
+## Dataset
+
+```bash
+wget http://storage.googleapis.com/gresearch/refraw360/360_v2.zip -O 360_v2.zip
 ./extract_dataset.sh
+```
 
-this extracts only the images from each scene in the 360_v2 dataset into `dataset/`.
-requires `p7zip` (`7z` command).
+Extracts only the images from each scene in `360_v2` into `dataset/`. Requires `p7zip` (`7z` command).
 
-## usage:
+## Usage
 
-cd src
+All commands run from `src/`.
 
-step 1-4:
+**Steps 1-4** (preprocessing):
+
+```bash
 python run_pipeline.py --dataset ../dataset --output ../output --prep
+```
 
-step 5+7:
-python run_pipeline.py --dataset ../dataset --output ../output --train_models 
+**Steps 5+7** (train all models):
 
-step 6+8
+```bash
+python run_pipeline.py --dataset ../dataset --output ../output --train_models
+```
+
+**Steps 6+8** (train single scene):
+
+```bash
 python run_pipeline.py --dataset ../dataset --output ../output --train_models --scene ../dataset/garden --n_views "A,B,C"
-
+```
