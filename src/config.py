@@ -3,12 +3,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 import torch
 
+# Project root: parent of src/
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
 @dataclass
 class RI3DConfig:
-    # Paths
-    scene_dir: Path = Path("dataset/garden")
-    dataset_dir: Path = Path("dataset")  # parent dir with all scene subdirs
-    output_dir: Path = Path("outputs")
+    # Paths (defaults are relative to project root, not CWD)
+    scene_dir: Path = None
+    dataset_dir: Path = None
+    output_dir: Path = None
 
     # View selection (int for count, or comma-separated filenames)
     n_views: int | str = 3
@@ -95,16 +98,27 @@ class RI3DConfig:
     densify_reset_every: int = 1000  # reset opacities to allow pruning
 
     # Checkpointing
-    checkpoint_dir: Path = Path("outputs/checkpoints")
+    checkpoint_dir: Path = None
 
     # Background mask clustering
     bg_mask_n_clusters: int = 2  # agglomerative clustering on depth
 
     def __post_init__(self):
-        self.scene_dir = Path(self.scene_dir)
-        self.dataset_dir = Path(self.dataset_dir)
-        self.output_dir = Path(self.output_dir)
-        self.checkpoint_dir = Path(self.checkpoint_dir)
+        # Apply defaults relative to project root
+        if self.dataset_dir is None:
+            self.dataset_dir = PROJECT_ROOT / "dataset"
+        if self.scene_dir is None:
+            self.scene_dir = self.dataset_dir / "garden"
+        if self.output_dir is None:
+            self.output_dir = PROJECT_ROOT / "output"
+        if self.checkpoint_dir is None:
+            self.checkpoint_dir = self.output_dir / "checkpoints"
+
+        # Resolve all paths to absolute (so CWD doesn't matter)
+        self.scene_dir = Path(self.scene_dir).resolve()
+        self.dataset_dir = Path(self.dataset_dir).resolve()
+        self.output_dir = Path(self.output_dir).resolve()
+        self.checkpoint_dir = Path(self.checkpoint_dir).resolve()
 
     @property
     def scene_name(self) -> str:

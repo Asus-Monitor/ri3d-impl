@@ -10,18 +10,18 @@ RI3D cleans up the floaters and inpaints holes with stable diffusion automatical
 
 Since we are just fine tuning models, you can train it yourself on a consumer level gpu. Works on my RTX 2060 Super. Cuda GPU required.
 
-All commands run from `src/`.
+All commands run from `src/`. Paths default to `<project_root>/dataset` and `<project_root>/output`.
 
 **Preprocessing** (Steps 1-4):
 
 ```bash
-python run_pipeline.py --dataset ../dataset --output ../output --prep
+python src/run_pipeline.py --prep
 ```
 
 **Training all models** (Steps 5+7):
 
 ```bash
-python run_pipeline.py --dataset ../dataset --output ../output --train_models
+python src/run_pipeline.py --train_models
 ```
 
 ### Dataset
@@ -40,5 +40,5 @@ All commands run from `src/`.
 **Steps 6+8** (make splat scene):
 
 ```bash
-python run_pipeline.py --dataset ../dataset --output ../output --train_models --scene ../dataset/garden --n_views "A,B,C"
+python src/run_pipeline.py --optimize --scene ../dataset/garden --n_views "A,B,C"
 ```

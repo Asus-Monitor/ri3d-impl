@@ -29,7 +29,7 @@ def load_scene_images(scene_dir: Path) -> list[str]:
     if len(paths) == 0:
         raise FileNotFoundError(f"No images found in {scene_dir}")
     print(f"Found {len(paths)} images in {scene_dir}")
-    return [str(p) for p in paths]
+    return [str(p.resolve()) for p in paths]
 
 
 def _resolve_names(names: list[str], image_paths: list[str]) -> list[str]:
@@ -404,12 +404,13 @@ def run_dust3r(cfg: RI3DConfig, model=None):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Step 1: DUSt3R camera + depth estimation")
     parser.add_argument("--scene", type=str, required=True, help="Path to scene image directory")
-    parser.add_argument("--output", type=str, default="outputs", help="Output directory")
+    parser.add_argument("--output", type=str, default=None, help="Output directory")
     parser.add_argument("--n_views", type=str, default="3",
                         help="Number of views to select (int), or comma-separated "
                              "filenames e.g. 'DSC_001.jpg,DSC_005.jpg,DSC_010.jpg'")
     args = parser.parse_args()
 
-    cfg = RI3DConfig(scene_dir=Path(args.scene), output_dir=Path(args.output),
+    cfg = RI3DConfig(scene_dir=Path(args.scene),
+                     output_dir=Path(args.output) if args.output else None,
                      n_views=args.n_views)
     run_dust3r(cfg)

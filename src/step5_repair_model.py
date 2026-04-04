@@ -384,15 +384,17 @@ def run_step5(cfg: RI3DConfig):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Step 5: Train repair model")
     parser.add_argument("--scene", type=str, required=True, help="Path to scene dir (or dataset root)")
-    parser.add_argument("--dataset", type=str, default="dataset", help="Dataset root with all scenes")
-    parser.add_argument("--output", type=str, default="outputs", help="Output directory")
+    parser.add_argument("--dataset", type=str, default=None, help="Dataset root with all scenes")
+    parser.add_argument("--output", type=str, default=None, help="Output directory")
     parser.add_argument("--n_views", type=str, default="3", help="Number of input views per scene")
     parser.add_argument("--data_only", action="store_true", help="Only generate data, don't train")
     parser.add_argument("--train_only", action="store_true", help="Only train, assume data exists")
     args = parser.parse_args()
 
-    cfg = RI3DConfig(scene_dir=Path(args.scene), dataset_dir=Path(args.dataset),
-                     output_dir=Path(args.output), n_views=args.n_views)
+    cfg = RI3DConfig(scene_dir=Path(args.scene),
+                     dataset_dir=Path(args.dataset) if args.dataset else None,
+                     output_dir=Path(args.output) if args.output else None,
+                     n_views=args.n_views)
 
     if args.data_only:
         generate_all_scenes_data(cfg)

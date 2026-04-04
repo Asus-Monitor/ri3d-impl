@@ -2,16 +2,16 @@
 
 Workflow:
   1. Prep all scenes (steps 1-4 per scene):
-       python run_pipeline.py --dataset dataset --n_views 3 --prep
+       python run_pipeline.py --prep
 
   2. Train shared models (steps 5+7 on all scenes combined):
-       python run_pipeline.py --dataset dataset --train_models
+       python run_pipeline.py --train_models
 
   3. Optimize a specific scene (steps 6+8):
        python run_pipeline.py --scene dataset/garden --optimize
 
   OR run everything for a single scene (uses all scenes for model training):
-       python run_pipeline.py --scene dataset/garden --dataset dataset --n_views 3
+       python run_pipeline.py --scene dataset/garden
 
   OR run only a specific step:
        python run_pipeline.py --scene dataset/garden --step 3 --only
@@ -216,8 +216,8 @@ def run_single_step(step_num: int, cfg: RI3DConfig):
 def main():
     parser = argparse.ArgumentParser(description="RI3D Pipeline")
     parser.add_argument("--scene", type=str, default=None, help="Path to a single scene directory")
-    parser.add_argument("--dataset", type=str, default="dataset", help="Dataset root (all scenes)")
-    parser.add_argument("--output", type=str, default="outputs", help="Output directory")
+    parser.add_argument("--dataset", type=str, default=None, help="Dataset root (all scenes)")
+    parser.add_argument("--output", type=str, default=None, help="Output directory")
     parser.add_argument("--n_views", type=str, default="3",
                         help="Number of views (int), or comma-separated filenames "
                              "e.g. 'DSC_001.jpg,DSC_005.jpg' (only with --scene). "
@@ -240,12 +240,19 @@ def main():
         parser.error("--n_views with filenames requires --scene. "
                      "For multi-scene prep, use views.txt in each scene dir.")
 
-    # Build config
-    scene_dir = Path(args.scene) if args.scene else Path(args.dataset)
+    # Build config — pass None for unset paths so RI3DConfig defaults apply
+    scene_dir = Path(args.scene) if args.scene else None
+    dataset_dir = Path(args.dataset) if args.dataset else None
+    output_dir = Path(args.output) if args.output else None
+
+    # If scene is given but dataset is not, infer dataset from scene's parent
+    if scene_dir is not None and dataset_dir is None:
+        dataset_dir = scene_dir.parent
+
     cfg = RI3DConfig(
-        scene_dir=scene_dir,
-        dataset_dir=Path(args.dataset),
-        output_dir=Path(args.output),
+        scene_dir=scene_dir or dataset_dir,
+        dataset_dir=dataset_dir,
+        output_dir=output_dir,
         n_views=args.n_views,
     )
 

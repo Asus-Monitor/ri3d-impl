@@ -572,8 +572,9 @@ def run_stage2(cfg: RI3DConfig):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Step 8: Stage 2 optimization")
     parser.add_argument("--scene", type=str, required=True, help="Path to scene image directory")
-    parser.add_argument("--output", type=str, default="outputs", help="Output directory")
+    parser.add_argument("--output", type=str, default=None, help="Output directory")
     args = parser.parse_args()
 
-    cfg = RI3DConfig(scene_dir=Path(args.scene), output_dir=Path(args.output))
+    cfg = RI3DConfig(scene_dir=Path(args.scene),
+                     output_dir=Path(args.output) if args.output else None)
     run_stage2(cfg)

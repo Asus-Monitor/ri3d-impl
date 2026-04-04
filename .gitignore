@@ -1,6 +1,6 @@
 *.pyc
-dataset/*
-src/outputs/*
+dataset/
+output/
 src/dust3r_visloc
 *.png
 *.pt
