@@ -194,7 +194,25 @@ def test_inpainting_model(cfg: RI3DConfig):
     from diffusers import StableDiffusionInpaintPipeline, LCMScheduler
     from peft import PeftModel
 
+    # Find an actual scene to test on (when --train_models is used, cfg.scene_dir
+    # may point to the dataset root rather than a specific scene)
     out_dir = cfg.scene_output_dir()
+    image_paths_file = out_dir / "image_paths.pt"
+    if not image_paths_file.exists():
+        # Try to find any prepared scene in the dataset
+        scenes = cfg.list_scenes()
+        found = False
+        for scene_dir in scenes:
+            scene_out = cfg.output_dir / scene_dir.name
+            if (scene_out / "image_paths.pt").exists():
+                out_dir = scene_out
+                image_paths_file = out_dir / "image_paths.pt"
+                found = True
+                break
+        if not found:
+            print("No prepared scenes found, skipping inpainting test.")
+            return
+
     test_dir = out_dir / "inpainting_test"
     test_dir.mkdir(parents=True, exist_ok=True)
 
@@ -209,11 +227,12 @@ def test_inpainting_model(cfg: RI3DConfig):
     ).to(device)
 
     pipe.unet = PeftModel.from_pretrained(pipe.unet, model_dir)
+    pipe.unet = pipe.unet.merge_and_unload()  # merge scene LoRA before adding LCM LoRA
     pipe.scheduler = LCMScheduler.from_config(pipe.scheduler.config)
     pipe.load_lora_weights(cfg.lcm_lora, adapter_name="lcm")
     pipe.safety_checker = None
 
-    image_paths = torch.load(out_dir / "image_paths.pt", weights_only=False)
+    image_paths = torch.load(image_paths_file, weights_only=False)
     n_test = min(3, len(image_paths))
 
     fig, axes = plt.subplots(3, n_test, figsize=(6 * n_test, 18))

@@ -48,6 +48,9 @@ def load_repair_pipeline(cfg: RI3DConfig):
 
     controlnet = ControlNetModel.from_pretrained(cfg.controlnet_model, torch_dtype=dtype)
     controlnet = PeftModel.from_pretrained(controlnet, model_dir)
+    # Merge LoRA weights into base model so isinstance(controlnet, ControlNetModel)
+    # passes the type check in the diffusers pipeline
+    controlnet = controlnet.merge_and_unload()
 
     pipe = StableDiffusionControlNetPipeline.from_pretrained(
         cfg.sd_model, controlnet=controlnet, torch_dtype=dtype,
@@ -155,8 +158,9 @@ def run_stage1(cfg: RI3DConfig):
     ssim_fn = SSIMLoss().to(device)
     lpips_fn = LPIPSLoss(device)
 
-    # Generate novel cameras (use point cloud centroid as scene center)
-    scene_center = gaussians_init["means"].mean(dim=0).to(device)
+    # Generate novel cameras (scene center from camera look-at points, robust to outliers)
+    from step4_gaussian_init import compute_scene_center
+    scene_center = compute_scene_center(poses, gaussians_init["means"].to(device))
     novel_c2w = generate_elliptical_cameras(poses, cfg.stage1_num_novel_views, scene_center).to(device)
     K_avg = intrinsics.mean(dim=0)
 
@@ -174,6 +178,9 @@ def run_stage1(cfg: RI3DConfig):
     plateau = PlateauDetector(cfg.plateau_window, cfg.plateau_threshold, cfg.plateau_min_iters)
     losses_history = []
 
+    # Cached background masks (recomputed at refresh intervals, not every step)
+    cached_bg_masks = [None] * cfg.stage1_num_novel_views
+
     print(f"\n=== Stage 1 Optimization ===")
     print(f"Input views: {n_images}, Novel views: {cfg.stage1_num_novel_views}")
     print(f"Max iters: {cfg.stage1_max_iters}, Refresh every: {cfg.stage1_refresh_interval}")
@@ -186,11 +193,15 @@ def run_stage1(cfg: RI3DConfig):
             with torch.no_grad():
                 for j in range(cfg.stage1_num_novel_views):
                     w2c = torch.linalg.inv(novel_c2w[j])
-                    r = model.render(w2c, K_avg, H, W)
+                    r = model.render(w2c, K_avg, H, W, return_depth=True)
                     repaired = repair_image(repair_pipe, r["image"], cfg)
                     pseudo_gt[j] = repaired.detach()
+                    # Cache background mask (expensive clustering — only at refresh)
+                    cached_bg_masks[j] = get_background_mask(
+                        r["depth"].squeeze(-1), cfg
+                    ).to(device)
 
-            # Save example renders
+            # Save example renders (every other refresh)
             if step % (cfg.stage1_refresh_interval * 2) == 0:
                 for j in range(min(3, cfg.stage1_num_novel_views)):
                     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
@@ -215,10 +226,14 @@ def run_stage1(cfg: RI3DConfig):
         w2c_ref = torch.linalg.inv(poses[ref_idx])
         K_ref = intrinsics[ref_idx]
 
+        # Use LPIPS only every 10 steps (expensive SqueezeNet forward pass)
+        use_lpips = (step % 10 == 0)
+        lpips_fn_or_none = lpips_fn if use_lpips else None
+
         result_ref = model.render_for_optim(w2c_ref, K_ref, H, W,
                                              strategy, strategy_state, step)
         ref_loss = reconstruction_loss(result_ref["image"], gt_images[ref_idx],
-                                        ssim_fn, lpips_fn, cfg)
+                                        ssim_fn, lpips_fn_or_none, cfg)
 
         # Depth correlation loss
         d_corr = depth_correlation_loss(result_ref["depth"], mono_depths[ref_idx])
@@ -231,10 +246,6 @@ def run_stage1(cfg: RI3DConfig):
             nov_idx = step % cfg.stage1_num_novel_views
             w2c_nov = torch.linalg.inv(novel_c2w[nov_idx])
 
-            with torch.no_grad():
-                r_nov = model.render(w2c_nov, K_avg, H, W, return_depth=True)
-
-            # Re-render with gradients for the selected novel view
             result_nov = model.render_for_optim(w2c_nov, K_avg, H, W,
                                                  strategy, strategy_state, step)
 
@@ -244,19 +255,18 @@ def run_stage1(cfg: RI3DConfig):
 
             nov_loss = reconstruction_loss(
                 result_nov["image"], pseudo_gt[nov_idx],
-                ssim_fn, lpips_fn, cfg,
+                ssim_fn, lpips_fn_or_none, cfg,
                 mask=alpha_mask,
             )
             total_loss = total_loss + lambda_j * nov_loss
 
             # Opacity regularization: suppress opacity in missing background regions
-            bg_mask = get_background_mask(
-                result_nov["depth"].squeeze(-1).detach(), cfg
-            )
-            opacity_reg = (
-                result_nov["alpha"].squeeze(-1) * (1 - alpha_mask) * bg_mask
-            ).abs().mean()
-            total_loss = total_loss + cfg.loss_opacity_reg_weight * opacity_reg
+            bg_mask = cached_bg_masks[nov_idx]
+            if bg_mask is not None:
+                opacity_reg = (
+                    result_nov["alpha"].squeeze(-1) * (1 - alpha_mask) * bg_mask
+                ).abs().mean()
+                total_loss = total_loss + cfg.loss_opacity_reg_weight * opacity_reg
 
         total_loss.backward()
         model.step_post_backward(step, result_ref["meta"])

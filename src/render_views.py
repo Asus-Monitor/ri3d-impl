@@ -38,7 +38,8 @@ def render_orbit(checkpoint_path: str, n_views: int = 36, output_dir: str = None
     out.mkdir(parents=True, exist_ok=True)
 
     model = GaussianModel(ckpt["gaussians"], device)
-    scene_center = ckpt["gaussians"]["means"].mean(dim=0).to(device)
+    from step4_gaussian_init import compute_scene_center
+    scene_center = compute_scene_center(poses, ckpt["gaussians"]["means"].to(device))
     orbit_c2w = generate_elliptical_cameras(poses, n_views, scene_center).to(device)
 
     print(f"Rendering {n_views} orbit views at {H}x{W}...")

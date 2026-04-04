@@ -66,12 +66,61 @@ def compute_pixel_size(depth: float, fx: float) -> float:
     return depth / fx
 
 
+def compute_scene_center(poses: torch.Tensor, points: torch.Tensor = None) -> torch.Tensor:
+    """Compute scene center as the average look-at point of input cameras.
+
+    For each camera, finds the median-depth point along its viewing ray within
+    the point cloud.  This is robust to distant background Gaussians that would
+    pull a simple point-cloud centroid away from the actual subject.
+
+    Args:
+        poses: (N, 4, 4) camera-to-world matrices (OpenCV: +Z forward)
+        points: (P, 3) 3D points (e.g. Gaussian means). If None, the scene
+                center is estimated purely from camera geometry.
+
+    Returns:
+        scene_center: (3,) world-space center
+    """
+    positions = poses[:, :3, 3]
+    cam_center = positions.mean(dim=0)
+
+    if points is not None and len(points) > 0:
+        look_ats = []
+        for i in range(len(poses)):
+            pos = positions[i]
+            fwd = poses[i, :3, 2]
+            fwd = fwd / fwd.norm()
+            # Project all points onto this camera's forward ray
+            vecs = points - pos.unsqueeze(0)
+            depths = (vecs * fwd.unsqueeze(0)).sum(dim=1)
+            in_front = depths > 0.01
+            if in_front.sum() > 0:
+                median_depth = depths[in_front].median()
+                look_ats.append(pos + median_depth * fwd)
+        if look_ats:
+            return torch.stack(look_ats).mean(dim=0)
+
+    # Fallback: step forward from camera center along mean gaze
+    forwards = poses[:, :3, 2]
+    mean_forward = forwards.mean(dim=0)
+    mean_forward = mean_forward / mean_forward.norm()
+    cam_spread = (positions - cam_center).norm(dim=1).mean().item()
+    return cam_center + max(cam_spread * 2.0, 0.5) * mean_forward
+
+
 def generate_elliptical_cameras(poses: torch.Tensor, n_cameras: int,
                                  scene_center: torch.Tensor = None) -> torch.Tensor:
-    """Generate novel cameras along an elliptical path looking at the scene.
+    """Generate novel cameras along an elliptical path aligned with input cameras.
+
+    Per paper (Sec 4.3): "we introduce a set of M novel cameras along an elliptical
+    path aligned with the input cameras."
+
+    Strategy: orbit in the plane perpendicular to the camera "up" direction
+    (a horizontal ring around the scene center). This is robust for any camera
+    arrangement because cameras always have a consistent up direction from
+    DUSt3R's global alignment.
 
     Uses OpenCV camera convention (DUSt3R output): +X right, +Y down, +Z forward.
-    Cameras orbit in a horizontal plane around the scene center.
 
     Args:
         poses: (N, 4, 4) input camera-to-world matrices (OpenCV convention)
@@ -85,7 +134,7 @@ def generate_elliptical_cameras(poses: torch.Tensor, n_cameras: int,
     cam_center = positions.mean(dim=0)  # (3,)
 
     # DUSt3R OpenCV convention: cameras look along +Z in local frame
-    forwards = poses[:, :3, 2]  # (N, 3) — +Z column of rotation
+    forwards = poses[:, :3, 2]  # (N, 3)
     mean_forward = forwards.mean(dim=0)
     mean_forward = mean_forward / mean_forward.norm()
 
@@ -95,29 +144,35 @@ def generate_elliptical_cameras(poses: torch.Tensor, n_cameras: int,
         depth_est = max(cam_spread * 2.0, 0.5)
         scene_center = cam_center + depth_est * mean_forward
 
-    # Up direction: OpenCV convention has +Y down, so camera "up" is -Y
-    ups = -poses[:, :3, 1]  # (N, 3) — negate Y column for world up
-    mean_up = ups.mean(dim=0)
+    # Camera "up" direction (OpenCV: Y is down, so up = -Y column of c2w)
+    mean_up = -poses[:, :3, 1].mean(dim=0)
     mean_up = mean_up / mean_up.norm()
 
-    # Build two horizontal orbit axes around the scene center.
-    # axis1 = right (perpendicular to up and forward)
-    # axis2 = perpendicular to both up and axis1 (the other horizontal direction)
-    axis1 = torch.linalg.cross(mean_forward, mean_up)
+    # --- Build orbit plane perpendicular to "up" (horizontal ring) ---
+    # Direction from cameras toward scene, projected onto the horizontal plane
+    look_dir = scene_center - cam_center
+    look_horiz = look_dir - (look_dir @ mean_up) * mean_up
+    if look_horiz.norm() < 1e-6:
+        # Scene directly above/below cameras — use mean_forward as fallback
+        look_horiz = mean_forward - (mean_forward @ mean_up) * mean_up
+    look_horiz = look_horiz / look_horiz.norm()
+
+    # Two orthogonal horizontal axes for the orbit
+    axis1 = torch.linalg.cross(mean_up, look_horiz)  # perpendicular to look direction
     axis1 = axis1 / axis1.norm()
-    axis2 = torch.linalg.cross(mean_up, axis1)
-    axis2 = axis2 / axis2.norm()
+    axis2 = look_horiz  # toward the scene
 
-    # Orbit radius: mean distance from scene center to input cameras
-    cam_to_scene = (positions - scene_center.unsqueeze(0)).norm(dim=1)
-    orbit_radius = cam_to_scene.mean().item()
-    orbit_radius = max(orbit_radius, 0.3)
+    # Orbit radius: horizontal distance from scene center to input cameras
+    sc_offsets = positions - scene_center.unsqueeze(0)  # (N, 3)
+    horiz_offsets = sc_offsets - (sc_offsets @ mean_up).unsqueeze(-1) * mean_up.unsqueeze(0)
+    orbit_radius = horiz_offsets.norm(dim=1).mean().item()
+    orbit_radius = max(orbit_radius * 1.1, 0.3)
 
-    # Height: keep novel cameras at the same height (along up) as input cameras
-    offsets = positions - scene_center.unsqueeze(0)
-    mean_height = (offsets @ mean_up).mean().item()
+    # Height: median camera displacement from scene center along up direction
+    # (median is more robust than mean when one camera is an outlier)
+    mean_height = (sc_offsets @ mean_up).median().item()
 
-    # Generate cameras on horizontal circle around scene center
+    # Generate cameras on circle in horizontal plane around scene center
     angles = torch.linspace(0, 2 * math.pi, n_cameras + 1, device=poses.device)[:-1]
     novel_c2w = torch.zeros(n_cameras, 4, 4, device=poses.device)
 
@@ -135,11 +190,10 @@ def generate_elliptical_cameras(poses: torch.Tensor, n_cameras: int,
         # Build camera axes (OpenCV: X=right, Y=down, Z=forward)
         r_vec = torch.linalg.cross(fwd, mean_up)
         if r_vec.norm() < 1e-6:
-            # Camera looking straight up/down — use axis1 as fallback right
             r_vec = axis1
         r_vec = r_vec / r_vec.norm()
         down = torch.linalg.cross(fwd, r_vec)
-        # Ensure down points downward (same direction as -mean_up)
+        # Ensure down points in the -up direction
         if down @ (-mean_up) < 0:
             down = -down
             r_vec = -r_vec
@@ -304,9 +358,22 @@ def render_initial_views(cfg: RI3DConfig):
 
     # Also render a few novel views
     print("\nRendering novel views...")
-    # Use point cloud centroid as scene center for better camera placement
-    scene_center = means.mean(dim=0)
+    # Compute scene center from camera look-at points (robust to distant Gaussians)
+    scene_center = compute_scene_center(poses, means)
     novel_c2w = generate_elliptical_cameras(poses, n_cameras=4, scene_center=scene_center)
+
+    # Diagnostic: print camera arrangement info
+    cam_positions = poses[:, :3, 3]
+    print(f"  Scene center: {scene_center.cpu().tolist()}")
+    print(f"  Camera center: {cam_positions.mean(dim=0).cpu().tolist()}")
+    for i in range(len(image_paths)):
+        p = cam_positions[i].cpu()
+        d = (p - scene_center.cpu()).norm().item()
+        print(f"  Input cam {i}: pos={p.tolist()}, dist_to_scene={d:.3f}")
+    for j in range(4):
+        p = novel_c2w[j, :3, 3].cpu()
+        d = (p - scene_center.cpu()).norm().item()
+        print(f"  Novel cam {j}: pos={p.tolist()}, dist_to_scene={d:.3f}")
     K_avg = intrinsics.mean(dim=0)  # use average intrinsics for novel views
 
     for j in range(4):

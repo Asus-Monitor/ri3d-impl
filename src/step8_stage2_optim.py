@@ -54,6 +54,7 @@ def load_inpainting_pipeline(cfg: RI3DConfig):
     ).to(device)
 
     pipe.unet = PeftModel.from_pretrained(pipe.unet, model_dir)
+    pipe.unet = pipe.unet.merge_and_unload()  # merge scene LoRA before adding LCM LoRA
     pipe.scheduler = LCMScheduler.from_config(pipe.scheduler.config)
     pipe.load_lora_weights(cfg.lcm_lora, adapter_name="lcm")
     pipe.safety_checker = None
@@ -240,8 +241,9 @@ def run_stage2(cfg: RI3DConfig):
     ssim_fn = SSIMLoss().to(device)
     lpips_fn = LPIPSLoss(device)
 
-    # Generate novel cameras (use point cloud centroid as scene center)
-    scene_center = stage1_ckpt["gaussians"]["means"].mean(dim=0).to(device)
+    # Generate novel cameras (scene center from camera look-at points, robust to outliers)
+    from step4_gaussian_init import compute_scene_center
+    scene_center = compute_scene_center(poses, stage1_ckpt["gaussians"]["means"].to(device))
     novel_c2w = generate_elliptical_cameras(poses, cfg.stage2_num_novel_views, scene_center).to(device)
     K_avg = intrinsics.mean(dim=0)
 
@@ -259,6 +261,7 @@ def run_stage2(cfg: RI3DConfig):
     pseudo_gt = [None] * cfg.stage2_num_novel_views
     inpainted_images = [None] * cfg.stage2_num_novel_views
     inpaint_masks = [None] * cfg.stage2_num_novel_views
+    cached_bg_masks = [None] * cfg.stage2_num_novel_views
 
     plateau = PlateauDetector(cfg.plateau_window, cfg.plateau_threshold, cfg.plateau_min_iters)
     losses_history = []
@@ -282,6 +285,7 @@ def run_stage2(cfg: RI3DConfig):
                     alpha_mask = get_opacity_mask(r["alpha"])
                     bg_mask = compute_background_mask(r["depth"].squeeze(-1).detach(),
                                                       cfg.bg_mask_n_clusters)
+                    cached_bg_masks[j] = bg_mask.to(device)
 
                     # Inpaint K views (every other view) if before cutoff
                     is_inpaint_view = (step < cfg.stage2_inpaint_cutoff and j % 2 == 0)
@@ -345,10 +349,14 @@ def run_stage2(cfg: RI3DConfig):
         w2c_ref = torch.linalg.inv(poses[ref_idx])
         K_ref = intrinsics[ref_idx]
 
+        # Use LPIPS only every 10 steps (expensive SqueezeNet forward pass)
+        use_lpips = (step % 10 == 0)
+        lpips_fn_or_none = lpips_fn if use_lpips else None
+
         result_ref = model.render_for_optim(w2c_ref, K_ref, H, W,
                                              strategy, strategy_state, step)
         ref_loss = reconstruction_loss(result_ref["image"], gt_images[ref_idx],
-                                        ssim_fn, lpips_fn, cfg)
+                                        ssim_fn, lpips_fn_or_none, cfg)
         d_corr = depth_correlation_loss(result_ref["depth"], mono_depths[ref_idx])
         ref_loss = ref_loss + cfg.loss_depth_corr_weight * d_corr
         total_loss = total_loss + ref_loss
@@ -365,7 +373,7 @@ def run_stage2(cfg: RI3DConfig):
             # No visibility mask — enforce across entire image in Stage 2
             nov_loss = reconstruction_loss(
                 result_nov["image"], pseudo_gt[nov_idx],
-                ssim_fn, lpips_fn, cfg,
+                ssim_fn, lpips_fn_or_none, cfg,
             )
             total_loss = total_loss + lambda_j * nov_loss
 

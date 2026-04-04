@@ -93,6 +93,11 @@ def generate_leave_one_out_data(cfg: RI3DConfig):
             all_pairs.append((corrupted_early, gt_images[left_out_idx]))
 
         # Phase 2: Re-add left-out view, continue training
+        # Paper (Sec 4.2): "by initially excluding an image and later reintroducing it,
+        # we generate progressively refined corrupted images, improving the repair model's
+        # ability to handle the final 3DGS optimization." The full spectrum from heavily
+        # corrupted to nearly clean is intentional — teaches the model to handle all
+        # corruption levels encountered during Stage 1 optimization.
         print(f"  Phase 2: re-adding view, training to {cfg.loo_total_iters} iters...")
         all_indices = list(range(n_images))
         for step in range(cfg.loo_initial_iters, cfg.loo_total_iters):
@@ -114,31 +119,29 @@ def generate_leave_one_out_data(cfg: RI3DConfig):
                     corrupted = r["image"].clamp(0, 1).cpu()
                     all_pairs.append((corrupted, gt_images[left_out_idx]))
 
-        # Final snapshot
-        with torch.no_grad():
-            r = model.render(w2c_lo, K_lo, H, W)
-            corrupted_final = r["image"].clamp(0, 1).cpu()
-            all_pairs.append((corrupted_final, gt_images[left_out_idx]))
-
         del model
         torch.cuda.empty_cache()
 
     print(f"\nGenerated {len(all_pairs)} training pairs for scene {cfg.scene_name}")
     torch.save(all_pairs, data_dir / "training_pairs.pt")
 
-    # Save visual preview
+    # Save visual preview — sample evenly across all pairs to show different views
     n_show = min(8, len(all_pairs))
-    fig, axes = plt.subplots(2, n_show, figsize=(4 * n_show, 8))
-    for j in range(n_show):
-        axes[0, j].imshow(all_pairs[j][0].numpy())
-        axes[0, j].set_title(f"Corrupted {j}")
-        axes[0, j].axis("off")
-        axes[1, j].imshow(all_pairs[j][1].numpy())
-        axes[1, j].set_title(f"Clean {j}")
-        axes[1, j].axis("off")
-    fig.suptitle(f"Leave-One-Out Pairs — {cfg.scene_name}")
-    fig.savefig(data_dir / "pairs_preview.png", dpi=120, bbox_inches="tight")
-    plt.close(fig)
+    if n_show > 0:
+        preview_indices = [int(i * len(all_pairs) / n_show) for i in range(n_show)]
+        fig, axes = plt.subplots(2, n_show, figsize=(4 * n_show, 8))
+        if n_show == 1:
+            axes = axes.reshape(-1, 1)
+        for col, j in enumerate(preview_indices):
+            axes[0, col].imshow(all_pairs[j][0].numpy())
+            axes[0, col].set_title(f"Corrupted (pair {j})")
+            axes[0, col].axis("off")
+            axes[1, col].imshow(all_pairs[j][1].numpy())
+            axes[1, col].set_title(f"Clean (pair {j})")
+            axes[1, col].axis("off")
+        fig.suptitle(f"Leave-One-Out Pairs — {cfg.scene_name} ({len(all_pairs)} total)")
+        fig.savefig(data_dir / "pairs_preview.png", dpi=120, bbox_inches="tight")
+        plt.close(fig)
 
     return all_pairs
 
@@ -320,6 +323,7 @@ def test_repair_model(cfg: RI3DConfig):
     print("Loading repair pipeline for test...")
     controlnet = ControlNetModel.from_pretrained(cfg.controlnet_model, torch_dtype=dtype)
     controlnet = PeftModel.from_pretrained(controlnet, model_dir)
+    controlnet = controlnet.merge_and_unload()
 
     pipe = StableDiffusionControlNetPipeline.from_pretrained(
         cfg.sd_model, controlnet=controlnet, torch_dtype=dtype,
