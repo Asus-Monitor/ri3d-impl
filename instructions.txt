@@ -1,6 +1,0 @@
-good now look over stage 1 again too and fix any slowdowns and inconsistentcies with paper. then check both stages and really think about any issues or slowdowns and if its 1:1 with paper to ensure a correct output
-issues:
-for --prep (step 1-4) we could make it so that each scene does step1, then each scene does step2, etc. like currently its 1,2,3,4, 1,2,3,4, 1,2,3,4 etc but this is bad because then we have to re-load models all the time. we have to do 1,1,1,1,1 2,2,2,2,2, 3,3,3,3 etc
-
-
-claude --resume c0125156-f754-41f5-964a-f39edb52a6a6

@@ -1,5 +1,13 @@
 
-usage:
+## dataset
+
+wget LINK -O 360_v2.zip
+./extract_dataset.sh
+
+this extracts only the images from each scene in the 360_v2 dataset into `dataset/`.
+requires `p7zip` (`7z` command).
+
+## usage:
 
 cd src
 
