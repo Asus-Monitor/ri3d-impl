@@ -323,10 +323,17 @@ def run_stage2(cfg: RI3DConfig):
     for j in range(cfg.stage2_num_novel_views):
         camera_weights[j] = compute_camera_distance_weight(novel_c2w[j], poses)
 
+    # Precompute w2c matrices
+    input_w2c = torch.linalg.inv(poses)       # (N, 4, 4)
+    novel_w2c = torch.linalg.inv(novel_c2w)   # (M, 4, 4)
+
+    # Diffusion pipelines — loaded lazily, freed when no longer needed
+    inpaint_pipe = None
+    repair_pipe = None
+
     # Storage
     pseudo_gt = [None] * cfg.stage2_num_novel_views
     inpainted_images = [None] * cfg.stage2_num_novel_views
-    inpaint_masks = [None] * cfg.stage2_num_novel_views
     cached_bg_masks = [None] * cfg.stage2_num_novel_views
     last_inpainted = set()  # track which views were inpainted last cycle
 
@@ -348,8 +355,7 @@ def run_stage2(cfg: RI3DConfig):
                 # Phase 1: Render all novel views (fast — just gsplat)
                 renders_cache = {}
                 for j in range(cfg.stage2_num_novel_views):
-                    w2c = torch.linalg.inv(novel_c2w[j])
-                    r = model.render(w2c, K_avg, H, W, return_depth=True)
+                    r = model.render(novel_w2c[j], K_avg, H, W, return_depth=True)
                     alpha_mask = get_opacity_mask(r["alpha"])
                     bg_mask = compute_background_mask(
                         r["depth"].squeeze(-1).detach(), cfg.bg_mask_n_clusters
@@ -375,10 +381,9 @@ def run_stage2(cfg: RI3DConfig):
 
                     if inpaint_views:
                         # Load inpaint pipeline on first use
-                        if not hasattr(run_stage2, "_inpaint_pipe"):
+                        if inpaint_pipe is None:
                             print("  Loading inpainting pipeline...")
-                            run_stage2._inpaint_pipe = load_inpainting_pipeline(cfg)
-                        inpaint_pipe = run_stage2._inpaint_pipe
+                            inpaint_pipe = load_inpainting_pipeline(cfg)
 
                         for j in inpaint_views:
                             rc = renders_cache[j]
@@ -387,11 +392,11 @@ def run_stage2(cfg: RI3DConfig):
                                 rc["bg_mask"], cfg,
                             )
                             inpainted_images[j] = inpainted.detach()
-                            inpaint_masks[j] = ((1 - rc["alpha_mask"]) * rc["bg_mask"]).detach()
 
                             # Project into 3D (subsampled, fast linear alignment)
+                            missing_mask = ((1 - rc["alpha_mask"]) * rc["bg_mask"]).detach()
                             new_gs = project_inpainted_to_3d(
-                                inpainted, inpaint_masks[j],
+                                inpainted, missing_mask,
                                 rc["depth"], novel_c2w[j], K_avg, cfg,
                             )
                             if new_gs is not None:
@@ -405,17 +410,17 @@ def run_stage2(cfg: RI3DConfig):
                                       f"Gaussians (total: {model.n_gaussians})")
                 else:
                     # Past cutoff — free inpaint + depth models
-                    if hasattr(run_stage2, "_inpaint_pipe"):
-                        del run_stage2._inpaint_pipe
+                    if inpaint_pipe is not None:
+                        del inpaint_pipe
+                        inpaint_pipe = None
                         clear_mono_depth_cache()
                         torch.cuda.empty_cache()
                         print("  Freed inpainting + depth models (past cutoff)")
 
                 # Phase 3: Repair all novel views
-                if not hasattr(run_stage2, "_repair_pipe"):
+                if repair_pipe is None:
                     print("  Loading repair pipeline...")
-                    run_stage2._repair_pipe = load_repair_pipeline(cfg)
-                repair_pipe = run_stage2._repair_pipe
+                    repair_pipe = load_repair_pipeline(cfg)
 
                 for j in range(cfg.stage2_num_novel_views):
                     rc = renders_cache[j]
@@ -432,8 +437,7 @@ def run_stage2(cfg: RI3DConfig):
             if step % (cfg.stage2_inpaint_interval * 4) == 0:
                 for j in range(min(3, cfg.stage2_num_novel_views)):
                     with torch.no_grad():
-                        w2c = torch.linalg.inv(novel_c2w[j])
-                        r = model.render(w2c, K_avg, H, W)
+                        r = model.render(novel_w2c[j], K_avg, H, W)
 
                     n_cols = 4 if inpainted_images[j] is not None else 3
                     fig, axes = plt.subplots(1, n_cols, figsize=(5 * n_cols, 5))
@@ -455,7 +459,7 @@ def run_stage2(cfg: RI3DConfig):
 
         # --- Input view loss ---
         ref_idx = step % n_images
-        w2c_ref = torch.linalg.inv(poses[ref_idx])
+        w2c_ref = input_w2c[ref_idx]
         K_ref = intrinsics[ref_idx]
 
         use_lpips = (step % 10 == 0)
@@ -472,7 +476,7 @@ def run_stage2(cfg: RI3DConfig):
         # --- Novel view loss (no visibility mask in Stage 2) ---
         if pseudo_gt[0] is not None:
             nov_idx = step % cfg.stage2_num_novel_views
-            w2c_nov = torch.linalg.inv(novel_c2w[nov_idx])
+            w2c_nov = novel_w2c[nov_idx]
 
             result_nov = model.render_for_loss(w2c_nov, K_avg, H, W)
             lambda_j = camera_weights[nov_idx]
@@ -484,8 +488,11 @@ def run_stage2(cfg: RI3DConfig):
             total_loss = total_loss + lambda_j * nov_loss
 
             # Inpainting consistency loss: (1-M_α) ⊙ M_b ⊙ Lp (per paper)
-            if inpainted_images[nov_idx] is not None and inpaint_masks[nov_idx] is not None:
-                mask_ip = inpaint_masks[nov_idx]
+            # Use CURRENT alpha mask, not stale cached one — as optimization
+            # fills regions, the mask should shrink automatically
+            if inpainted_images[nov_idx] is not None and cached_bg_masks[nov_idx] is not None:
+                alpha_mask_now = get_opacity_mask(result_nov["alpha"])
+                mask_ip = (1 - alpha_mask_now) * cached_bg_masks[nov_idx]
                 n_masked = mask_ip.sum().clamp(min=1)
                 mask_3ch = mask_ip.unsqueeze(-1)
                 inpaint_loss = (
@@ -538,14 +545,12 @@ def run_stage2(cfg: RI3DConfig):
     with torch.no_grad():
         for i in range(n_images):
             name = Path(image_paths[i]).stem
-            w2c = torch.linalg.inv(poses[i])
-            r = model.render(w2c, intrinsics[i], H, W)
+            r = model.render(input_w2c[i], intrinsics[i], H, W)
             img = r["image"].clamp(0, 1).cpu().numpy()
             plt.imsave(render_dir / f"final_input_{i:03d}_{name}.png", img)
 
         for j in range(cfg.stage2_num_novel_views):
-            w2c = torch.linalg.inv(novel_c2w[j])
-            r = model.render(w2c, K_avg, H, W)
+            r = model.render(novel_w2c[j], K_avg, H, W)
             img = r["image"].clamp(0, 1).cpu().numpy()
             alpha = r["alpha"].squeeze(-1).cpu().numpy()
             plt.imsave(render_dir / f"final_novel_{j:03d}.png", img)
@@ -553,10 +558,10 @@ def run_stage2(cfg: RI3DConfig):
 
     # Cleanup
     clear_mono_depth_cache()
-    if hasattr(run_stage2, "_repair_pipe"):
-        del run_stage2._repair_pipe
-    if hasattr(run_stage2, "_inpaint_pipe"):
-        del run_stage2._inpaint_pipe
+    if repair_pipe is not None:
+        del repair_pipe
+    if inpaint_pipe is not None:
+        del inpaint_pipe
     del model
     torch.cuda.empty_cache()
 

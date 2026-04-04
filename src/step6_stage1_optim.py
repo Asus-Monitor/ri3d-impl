@@ -170,6 +170,10 @@ def run_stage1(cfg: RI3DConfig):
     novel_c2w = generate_elliptical_cameras(poses, cfg.stage1_num_novel_views, scene_center).to(device)
     K_avg = intrinsics.mean(dim=0)
 
+    # Precompute w2c matrices (avoids repeated torch.linalg.inv per step)
+    input_w2c = torch.linalg.inv(poses)       # (N, 4, 4)
+    novel_w2c = torch.linalg.inv(novel_c2w)   # (M, 4, 4)
+
     # Load repair pipeline
     print("Loading repair model for Stage 1...")
     repair_pipe = load_repair_pipeline(cfg)
@@ -199,8 +203,7 @@ def run_stage1(cfg: RI3DConfig):
             print(f"\n  Refreshing pseudo GT at step {step}...")
             with torch.no_grad():
                 for j in range(cfg.stage1_num_novel_views):
-                    w2c = torch.linalg.inv(novel_c2w[j])
-                    r = model.render(w2c, K_avg, H, W, return_depth=True)
+                    r = model.render(novel_w2c[j], K_avg, H, W, return_depth=True)
                     repaired = repair_image(repair_pipe, r["image"], cfg)
                     pseudo_gt[j] = repaired.detach()
                     # Cache background mask (expensive clustering — only at refresh)
@@ -226,7 +229,7 @@ def run_stage1(cfg: RI3DConfig):
 
         # --- Input view loss (with densification hooks) ---
         ref_idx = step % n_images
-        w2c_ref = torch.linalg.inv(poses[ref_idx])
+        w2c_ref = input_w2c[ref_idx]
         K_ref = intrinsics[ref_idx]
 
         use_lpips = (step % 10 == 0)
@@ -249,7 +252,7 @@ def run_stage1(cfg: RI3DConfig):
         # do NOT drive Gaussian splitting/cloning/pruning.
         if pseudo_gt[0] is not None:
             nov_idx = step % cfg.stage1_num_novel_views
-            w2c_nov = torch.linalg.inv(novel_c2w[nov_idx])
+            w2c_nov = novel_w2c[nov_idx]
 
             result_nov = model.render_for_loss(w2c_nov, K_avg, H, W)
 
@@ -312,14 +315,12 @@ def run_stage1(cfg: RI3DConfig):
     with torch.no_grad():
         for i in range(n_images):
             name = Path(image_paths[i]).stem
-            w2c = torch.linalg.inv(poses[i])
-            r = model.render(w2c, intrinsics[i], H, W)
+            r = model.render(input_w2c[i], intrinsics[i], H, W)
             img = r["image"].clamp(0, 1).cpu().numpy()
             plt.imsave(render_dir / f"final_input_{i:03d}_{name}.png", img)
 
         for j in range(cfg.stage1_num_novel_views):
-            w2c = torch.linalg.inv(novel_c2w[j])
-            r = model.render(w2c, K_avg, H, W)
+            r = model.render(novel_w2c[j], K_avg, H, W)
             img = r["image"].clamp(0, 1).cpu().numpy()
             alpha = r["alpha"].squeeze(-1).cpu().numpy()
             plt.imsave(render_dir / f"final_novel_{j:03d}.png", img)

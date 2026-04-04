@@ -215,8 +215,13 @@ class SSIMLoss(nn.Module):
         window = window.unsqueeze(0).unsqueeze(0).expand(channel, 1, -1, -1)
         self.register_buffer("window", window)
 
-    def forward(self, img1: torch.Tensor, img2: torch.Tensor) -> torch.Tensor:
-        """img1, img2: (H, W, 3) in [0,1]."""
+    def forward(self, img1: torch.Tensor, img2: torch.Tensor,
+                return_map: bool = False) -> torch.Tensor:
+        """img1, img2: (H, W, 3) in [0,1].
+
+        If return_map=True, returns (H, W) per-pixel SSIM loss map (1 - SSIM).
+        Otherwise returns scalar mean loss.
+        """
         # Rearrange to (1, C, H, W)
         x = img1.permute(2, 0, 1).unsqueeze(0)
         y = img2.permute(2, 0, 1).unsqueeze(0)
@@ -238,6 +243,10 @@ class SSIMLoss(nn.Module):
         ssim_map = ((2 * mu12 + C1) * (2 * sigma12 + C2)) / \
                    ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
 
+        if return_map:
+            # (1, C, H, W) -> mean over channels -> (H, W)
+            return 1.0 - ssim_map.squeeze(0).mean(dim=0)
+
         return 1.0 - ssim_map.mean()
 
 
@@ -245,15 +254,23 @@ class LPIPSLoss:
     """Perceptual loss using LPIPS (SqueezeNet for low memory)."""
 
     def __init__(self, device="cuda"):
-        self.loss_fn = lpips_module.LPIPS(net="squeeze").to(device).eval()
+        self.loss_fn = lpips_module.LPIPS(net="squeeze", spatial=True).to(device).eval()
         for p in self.loss_fn.parameters():
             p.requires_grad_(False)
 
-    def __call__(self, img1: torch.Tensor, img2: torch.Tensor) -> torch.Tensor:
-        """img1, img2: (H, W, 3) in [0,1]."""
+    def __call__(self, img1: torch.Tensor, img2: torch.Tensor,
+                 return_map: bool = False) -> torch.Tensor:
+        """img1, img2: (H, W, 3) in [0,1].
+
+        If return_map=True, returns (H, W) spatial loss map.
+        Otherwise returns scalar mean loss.
+        """
         x = img1.permute(2, 0, 1).unsqueeze(0) * 2 - 1  # to [-1, 1]
         y = img2.permute(2, 0, 1).unsqueeze(0) * 2 - 1
-        return self.loss_fn(x, y).mean()
+        spatial = self.loss_fn(x, y)  # (1, 1, H, W)
+        if return_map:
+            return spatial.squeeze(0).squeeze(0)  # (H, W)
+        return spatial.mean()
 
 
 def depth_correlation_loss(rendered_depth: torch.Tensor, mono_depth: torch.Tensor,
@@ -292,12 +309,9 @@ def reconstruction_loss(rendered: torch.Tensor, target: torch.Tensor,
                          mask: torch.Tensor | None = None) -> torch.Tensor:
     """Combined reconstruction loss: L1 + SSIM + LPIPS.
 
-    Per the paper, mask M_α is applied element-wise to each loss term.
-    For L1 this is straightforward. For SSIM/LPIPS (windowed losses),
-    we apply the mask as a per-pixel weight on the loss maps.
-
-    If ssim_fn is None, returns L1-only loss (useful for novel views
-    where structural losses can amplify repair model hallucinations).
+    Per the paper, mask M_α is applied to each loss term's spatial map.
+    We compute each loss on the FULL images and then mask the per-pixel
+    loss maps. This avoids boundary artifacts from zeroing unmasked regions.
 
     Args:
         rendered, target: (H, W, 3) images in [0, 1]
@@ -309,11 +323,10 @@ def reconstruction_loss(rendered: torch.Tensor, target: torch.Tensor,
     if mask is not None:
         if mask.dim() == 3:
             mask = mask.squeeze(-1)
-        mask_3ch = mask.unsqueeze(-1)  # (H, W, 1)
-        # Per-pixel L1, averaged only over masked region
-        l1_map = (rendered - target).abs()  # (H, W, 3)
         n_pixels = mask.sum().clamp(min=1)
-        l1 = (l1_map * mask_3ch).sum() / (n_pixels * 3)
+        mask_3ch = mask.unsqueeze(-1)  # (H, W, 1)
+        # Per-pixel L1 masked
+        l1 = ((rendered - target).abs() * mask_3ch).sum() / (n_pixels * 3)
     else:
         l1 = F.l1_loss(rendered, target)
 
@@ -321,17 +334,26 @@ def reconstruction_loss(rendered: torch.Tensor, target: torch.Tensor,
 
     if ssim_fn is not None:
         if mask is not None:
-            rendered_m = rendered * mask_3ch
-            target_m = target * mask_3ch
+            # Compute SSIM on full images, mask the spatial loss map
+            ssim_map = ssim_fn(rendered, target, return_map=True)  # (H, W)
+            ssim = (ssim_map * mask).sum() / n_pixels
         else:
-            rendered_m = rendered
-            target_m = target
-
-        ssim = ssim_fn(rendered_m, target_m)
+            ssim = ssim_fn(rendered, target)
         loss = loss + cfg.loss_ssim_weight * ssim
 
         if lpips_fn is not None:
-            lpips_val = lpips_fn(rendered_m, target_m)
+            if mask is not None:
+                # Compute LPIPS on full images, mask the spatial loss map
+                lpips_map = lpips_fn(rendered, target, return_map=True)  # (H, W)
+                # LPIPS map may differ in resolution — resize to match
+                if lpips_map.shape != mask.shape:
+                    lpips_map = F.interpolate(
+                        lpips_map.unsqueeze(0).unsqueeze(0),
+                        size=mask.shape, mode="bilinear", align_corners=False,
+                    ).squeeze()
+                lpips_val = (lpips_map * mask).sum() / n_pixels
+            else:
+                lpips_val = lpips_fn(rendered, target)
             loss = loss + cfg.loss_lpips_weight * lpips_val
 
     return loss
