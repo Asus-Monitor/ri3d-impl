@@ -1,6 +1,7 @@
 *.pyc
 dataset/*
-src/outputs
+src/outputs/*
+*.png
 *.pt
 dust3r
 croco

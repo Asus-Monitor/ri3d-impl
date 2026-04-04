@@ -152,7 +152,13 @@ def run_stage1(cfg: RI3DConfig):
     # Initialize model
     model = GaussianModel(gaussians_init, device)
     optimizers = model.setup_optimizers(cfg)
-    strategy, strategy_state = model.setup_strategy(cfg, scene_scale=1.0)
+
+    # Compute scene scale from camera positions (affects pruning thresholds)
+    cam_positions = poses[:, :3, 3]
+    scene_scale = (cam_positions - cam_positions.mean(dim=0)).norm(dim=1).mean().item()
+    scene_scale = max(scene_scale, 0.1)
+    print(f"  Scene scale: {scene_scale:.4f}")
+    strategy, strategy_state = model.setup_strategy(cfg, scene_scale=scene_scale)
 
     # Loss functions
     ssim_fn = SSIMLoss().to(device)
@@ -184,6 +190,7 @@ def run_stage1(cfg: RI3DConfig):
     print(f"\n=== Stage 1 Optimization ===")
     print(f"Input views: {n_images}, Novel views: {cfg.stage1_num_novel_views}")
     print(f"Max iters: {cfg.stage1_max_iters}, Refresh every: {cfg.stage1_refresh_interval}")
+    print(f"Densify: {cfg.densify_start}-{cfg.densify_stop}, reset every {cfg.densify_reset_every}")
 
     for step in tqdm(range(cfg.stage1_max_iters), desc="Stage 1"):
 
@@ -201,32 +208,30 @@ def run_stage1(cfg: RI3DConfig):
                         r["depth"].squeeze(-1), cfg
                     ).to(device)
 
-            # Save example renders (every other refresh)
-            if step % (cfg.stage1_refresh_interval * 2) == 0:
-                for j in range(min(3, cfg.stage1_num_novel_views)):
-                    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-                    with torch.no_grad():
-                        w2c = torch.linalg.inv(novel_c2w[j])
-                        r = model.render(w2c, K_avg, H, W)
-                    axes[0].imshow(r["image"].clamp(0,1).cpu().numpy())
-                    axes[0].set_title(f"Rendered (step {step})")
-                    axes[1].imshow(pseudo_gt[j].cpu().numpy())
-                    axes[1].set_title("Pseudo GT (repaired)")
-                    axes[2].imshow(r["alpha"].squeeze(-1).cpu().numpy(), cmap="gray")
-                    axes[2].set_title("Alpha")
-                    for ax in axes: ax.axis("off")
-                    fig.savefig(render_dir / f"step{step:05d}_novel{j}.png",
-                                dpi=120, bbox_inches="tight")
-                    plt.close(fig)
+            # Save example renders at every refresh
+            for j in range(min(3, cfg.stage1_num_novel_views)):
+                fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+                with torch.no_grad():
+                    w2c = torch.linalg.inv(novel_c2w[j])
+                    r = model.render(w2c, K_avg, H, W)
+                axes[0].imshow(r["image"].clamp(0,1).cpu().numpy())
+                axes[0].set_title(f"Rendered (step {step})")
+                axes[1].imshow(pseudo_gt[j].cpu().numpy())
+                axes[1].set_title("Pseudo GT (repaired)")
+                axes[2].imshow(r["alpha"].squeeze(-1).cpu().numpy(), cmap="gray")
+                axes[2].set_title("Alpha")
+                for ax in axes: ax.axis("off")
+                fig.savefig(render_dir / f"step{step:05d}_novel{j}.png",
+                            dpi=120, bbox_inches="tight")
+                plt.close(fig)
 
         total_loss = torch.tensor(0.0, device=device)
 
-        # --- Input view loss ---
+        # --- Input view loss (with densification hooks) ---
         ref_idx = step % n_images
         w2c_ref = torch.linalg.inv(poses[ref_idx])
         K_ref = intrinsics[ref_idx]
 
-        # Use LPIPS only every 10 steps (expensive SqueezeNet forward pass)
         use_lpips = (step % 10 == 0)
         lpips_fn_or_none = lpips_fn if use_lpips else None
 
@@ -241,15 +246,17 @@ def run_stage1(cfg: RI3DConfig):
 
         total_loss = total_loss + ref_loss
 
-        # --- Novel view loss (if pseudo GT available) ---
+        # --- Novel view loss (WITHOUT densification hooks) ---
+        # Per paper Eq. 4.3: λ_j * M_α_j * L_rec(rendered_j, repaired_j)
+        # Uses render_for_loss (no strategy hooks) so pseudo GT gradients
+        # do NOT drive Gaussian splitting/cloning/pruning.
         if pseudo_gt[0] is not None:
             nov_idx = step % cfg.stage1_num_novel_views
             w2c_nov = torch.linalg.inv(novel_c2w[nov_idx])
 
-            result_nov = model.render_for_optim(w2c_nov, K_avg, H, W,
-                                                 strategy, strategy_state, step)
+            result_nov = model.render_for_loss(w2c_nov, K_avg, H, W)
 
-            # Opacity mask: only enforce loss in visible regions
+            # Opacity mask: only enforce loss in visible regions (M_α)
             alpha_mask = get_opacity_mask(result_nov["alpha"])  # (H, W)
             lambda_j = camera_weights[nov_idx]
 
@@ -260,7 +267,7 @@ def run_stage1(cfg: RI3DConfig):
             )
             total_loss = total_loss + lambda_j * nov_loss
 
-            # Opacity regularization: suppress opacity in missing background regions
+            # Opacity regularization: ||A ⊙ (1 - M_α) ⊙ M_b||₁
             bg_mask = cached_bg_masks[nov_idx]
             if bg_mask is not None:
                 opacity_reg = (

@@ -91,7 +91,12 @@ class GaussianModel:
     def render_for_optim(self, w2c: torch.Tensor, K: torch.Tensor, H: int, W: int,
                           strategy: DefaultStrategy, strategy_state: dict, step: int,
                           bg_color: torch.Tensor | None = None) -> dict:
-        """Render with densification hooks for optimization."""
+        """Render with densification hooks for optimization (input views only).
+
+        Calls strategy.step_pre_backward to accumulate gradient statistics
+        for adaptive density control (splitting/cloning/pruning).
+        Only use this for input views with real ground truth.
+        """
         viewmats = w2c.unsqueeze(0).to(self.device)
         Ks = K.unsqueeze(0).to(self.device)
         backgrounds = bg_color.unsqueeze(0) if bg_color is not None else None
@@ -112,7 +117,7 @@ class GaussianModel:
             backgrounds=backgrounds,
         )
 
-        # Pre-backward hook
+        # Pre-backward hook for densification statistics
         strategy.step_pre_backward(self.params, self._optimizers, strategy_state, step, meta)
 
         return {
@@ -120,6 +125,40 @@ class GaussianModel:
             "alpha": render_alphas[0],
             "depth": render_colors[0, :, :, 3:4],
             "meta": meta,
+        }
+
+    def render_for_loss(self, w2c: torch.Tensor, K: torch.Tensor, H: int, W: int,
+                         bg_color: torch.Tensor | None = None) -> dict:
+        """Render with gradients but WITHOUT densification hooks (novel views).
+
+        Gradients flow through for loss computation, but do NOT influence
+        adaptive density control. Use this for novel views with pseudo GT
+        to prevent hallucinated content from driving Gaussian splitting/cloning.
+        """
+        viewmats = w2c.unsqueeze(0).to(self.device)
+        Ks = K.unsqueeze(0).to(self.device)
+        backgrounds = bg_color.unsqueeze(0) if bg_color is not None else None
+
+        render_colors, render_alphas, meta = rasterization(
+            means=self.params["means"],
+            quats=self.params["quats"],
+            scales=torch.exp(self.params["scales"]),
+            opacities=torch.sigmoid(self.params["opacities"]),
+            colors=self.params["colors"],
+            viewmats=viewmats,
+            Ks=Ks,
+            width=W, height=H,
+            sh_degree=None,
+            packed=True,
+            near_plane=0.01, far_plane=1000.0,
+            render_mode="RGB+D",
+            backgrounds=backgrounds,
+        )
+
+        return {
+            "image": render_colors[0, :, :, :3],
+            "alpha": render_alphas[0],
+            "depth": render_colors[0, :, :, 3:4],
         }
 
     def setup_optimizers(self, cfg: RI3DConfig) -> dict:
@@ -140,7 +179,8 @@ class GaussianModel:
             refine_stop_iter=cfg.densify_stop,
             refine_every=cfg.densify_interval,
             grow_grad2d=cfg.densify_grad_threshold,
-            verbose=False,
+            reset_every=cfg.densify_reset_every,
+            verbose=True,
         )
         self._strategy.check_sanity(self.params, self._optimizers)
         self._strategy_state = self._strategy.initialize_state(scene_scale=scene_scale)
@@ -246,7 +286,8 @@ def depth_correlation_loss(rendered_depth: torch.Tensor, mono_depth: torch.Tenso
 
 
 def reconstruction_loss(rendered: torch.Tensor, target: torch.Tensor,
-                         ssim_fn: SSIMLoss, lpips_fn: LPIPSLoss | None = None,
+                         ssim_fn: SSIMLoss | None = None,
+                         lpips_fn: LPIPSLoss | None = None,
                          cfg: RI3DConfig | None = None,
                          mask: torch.Tensor | None = None) -> torch.Tensor:
     """Combined reconstruction loss: L1 + SSIM + LPIPS.
@@ -254,6 +295,9 @@ def reconstruction_loss(rendered: torch.Tensor, target: torch.Tensor,
     Per the paper, mask M_α is applied element-wise to each loss term.
     For L1 this is straightforward. For SSIM/LPIPS (windowed losses),
     we apply the mask as a per-pixel weight on the loss maps.
+
+    If ssim_fn is None, returns L1-only loss (useful for novel views
+    where structural losses can amplify repair model hallucinations).
 
     Args:
         rendered, target: (H, W, 3) images in [0, 1]
@@ -273,21 +317,22 @@ def reconstruction_loss(rendered: torch.Tensor, target: torch.Tensor,
     else:
         l1 = F.l1_loss(rendered, target)
 
-    # SSIM and LPIPS operate on full images (windowed); masking zeros non-masked
-    # regions so they don't contribute meaningfully to the windowed loss
-    if mask is not None:
-        rendered_m = rendered * mask_3ch
-        target_m = target * mask_3ch
-    else:
-        rendered_m = rendered
-        target_m = target
+    loss = cfg.loss_l1_weight * l1
 
-    ssim = ssim_fn(rendered_m, target_m)
-    loss = cfg.loss_l1_weight * l1 + cfg.loss_ssim_weight * ssim
+    if ssim_fn is not None:
+        if mask is not None:
+            rendered_m = rendered * mask_3ch
+            target_m = target * mask_3ch
+        else:
+            rendered_m = rendered
+            target_m = target
 
-    if lpips_fn is not None:
-        lpips_val = lpips_fn(rendered_m, target_m)
-        loss = loss + cfg.loss_lpips_weight * lpips_val
+        ssim = ssim_fn(rendered_m, target_m)
+        loss = loss + cfg.loss_ssim_weight * ssim
+
+        if lpips_fn is not None:
+            lpips_val = lpips_fn(rendered_m, target_m)
+            loss = loss + cfg.loss_lpips_weight * lpips_val
 
     return loss
 

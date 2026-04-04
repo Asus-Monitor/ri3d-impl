@@ -159,8 +159,8 @@ def project_inpainted_to_3d(inpainted_image: torch.Tensor, missing_mask: torch.T
     if mask_flat.sum() == 0:
         return None
 
-    # Unproject missing pixels
-    pts = unproject_depth(fused, K.cpu(), c2w.cpu())  # (H*W, 3)
+    # Unproject missing pixels (all on CPU to avoid device mismatch)
+    pts = unproject_depth(fused.cpu(), K.cpu(), c2w.cpu())  # (H*W, 3)
     colors = inpainted_image.reshape(-1, 3).cpu()
 
     pts = pts[mask_flat.cpu()]
@@ -235,7 +235,12 @@ def run_stage2(cfg: RI3DConfig):
     # Initialize model from Stage 1
     model = GaussianModel(stage1_ckpt["gaussians"], device)
     optimizers = model.setup_optimizers(cfg)
-    strategy, strategy_state = model.setup_strategy(cfg, scene_scale=1.0)
+
+    # Compute scene scale from camera positions
+    cam_positions = poses[:, :3, 3]
+    scene_scale = (cam_positions - cam_positions.mean(dim=0)).norm(dim=1).mean().item()
+    scene_scale = max(scene_scale, 0.1)
+    strategy, strategy_state = model.setup_strategy(cfg, scene_scale=scene_scale)
 
     # Loss functions
     ssim_fn = SSIMLoss().to(device)
@@ -366,8 +371,7 @@ def run_stage2(cfg: RI3DConfig):
             nov_idx = step % cfg.stage2_num_novel_views
             w2c_nov = torch.linalg.inv(novel_c2w[nov_idx])
 
-            result_nov = model.render_for_optim(w2c_nov, K_avg, H, W,
-                                                 strategy, strategy_state, step)
+            result_nov = model.render_for_loss(w2c_nov, K_avg, H, W)
             lambda_j = camera_weights[nov_idx]
 
             # No visibility mask — enforce across entire image in Stage 2

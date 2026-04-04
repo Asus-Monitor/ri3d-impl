@@ -87,11 +87,12 @@ class RI3DConfig:
     plateau_threshold: float = 1e-4  # min relative improvement to continue
     plateau_min_iters: int = 1000   # minimum iters before allowing early stop
 
-    # 3DGS densification
+    # 3DGS densification (scaled for 4000-iter optimization)
     densify_start: int = 500
-    densify_stop: int = 3000
+    densify_stop: int = 2000
     densify_interval: int = 100
     densify_grad_threshold: float = 0.0002
+    densify_reset_every: int = 1000  # reset opacities to allow pruning
 
     # Checkpointing
     checkpoint_dir: Path = Path("outputs/checkpoints")
