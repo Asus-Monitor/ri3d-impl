@@ -299,8 +299,14 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
             clean_latent = vae.encode(clean_512 * 2 - 1).latent_dist.sample() * vae.config.scaling_factor
 
         noise = torch.randn_like(clean_latent)
-        t = torch.randint(0, noise_scheduler.config.num_train_timesteps, (1,),
-                          device=device).long()
+        # Bias timestep sampling toward the img2img inference range [0, T*strength].
+        # 80% of samples from the inference range, 20% from the full range for robustness.
+        max_t = noise_scheduler.config.num_train_timesteps
+        inference_max_t = int(max_t * cfg.repair_strength)
+        if random.random() < 0.8:
+            t = torch.randint(0, inference_max_t, (1,), device=device).long()
+        else:
+            t = torch.randint(0, max_t, (1,), device=device).long()
         noisy_latent = noise_scheduler.add_noise(clean_latent, noise, t)
 
         controlnet_output = controlnet(

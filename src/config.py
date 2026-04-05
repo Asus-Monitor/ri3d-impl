@@ -45,12 +45,12 @@ class RI3DConfig:
     sd_model: str = "stable-diffusion-v1-5/stable-diffusion-v1-5"
     controlnet_model: str = "lllyasviel/control_v11f1e_sd15_tile"
     repair_train_iters: int = 200
-    repair_lr: float = 1e-5
+    repair_lr: float = 1e-4
     repair_lora_rank: int = 64
     repair_inference_steps: int = 15   # DPM++ 2M Karras (no LCM for ControlNet)
     repair_guidance_scale: float = 1.0  # low CFG — repair should preserve structure, not hallucinate
     repair_controlnet_scale: float = 1.0  # ControlNet conditioning strength
-    repair_strength: float = 0.75       # img2img denoising strength (0=no change, 1=full regeneration)
+    repair_strength: float = 0.6        # img2img denoising strength (0=no change, 1=full regeneration)
 
     # LCM (used for inpainting only — incompatible with ControlNet)
     lcm_lora: str = "latent-consistency/lcm-lora-sdv1-5"
