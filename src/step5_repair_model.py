@@ -25,9 +25,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from config import RI3DConfig
-from gaussian_trainer import (
-    GaussianModel, SSIMLoss, reconstruction_loss, PlateauDetector
-)
+from gaussian_trainer import GaussianModel
 
 
 def generate_leave_one_out_data(cfg: RI3DConfig):
@@ -48,73 +46,86 @@ def generate_leave_one_out_data(cfg: RI3DConfig):
     fused_depth = torch.load(out_dir / "fused_depths" / "fused_depth_000.pt", weights_only=True)
     H, W = fused_depth.shape
 
-    gt_images = []
+    # Load GT at DUSt3R resolution (for 3DGS training and repair pairs)
+    gt_images_render = []
     for ip in image_paths:
-        img = Image.open(ip).convert("RGB").resize((W, H), Image.LANCZOS)
-        gt_images.append(torch.from_numpy(np.array(img)).float() / 255.0)
+        img = Image.open(ip).convert("RGB")
+        gt_images_render.append(
+            torch.from_numpy(np.array(img.resize((W, H), Image.LANCZOS))).float() / 255.0
+        )
 
-    ssim_fn = SSIMLoss().to(device)
     all_pairs = []
+
+    # Pre-compute w2c matrices and move everything to GPU once
+    w2c_all = torch.linalg.inv(poses).to(device)
+    K_all = intrinsics.to(device)
+
+    # Downscaled resolution for LOO training — rasterization cost scales with pixel count.
+    # Snapshots still render at full res for quality pairs.
+    s = cfg.loo_render_scale
+    loo_H, loo_W = int(H * s), int(W * s)
+    loo_K_all = K_all.clone()
+    loo_K_all[:, 0, :] *= s  # scale fx, cx
+    loo_K_all[:, 1, :] *= s  # scale fy, cy
+
+    # GT images at LOO resolution for training loss (on GPU)
+    gt_gpu_loo = []
+    for g in gt_images_render:
+        g_loo = F.interpolate(
+            g.permute(2, 0, 1).unsqueeze(0), size=(loo_H, loo_W),
+            mode="bilinear", align_corners=False,
+        ).squeeze(0).permute(1, 2, 0).to(device)
+        gt_gpu_loo.append(g_loo)
+
+    torch.backends.cudnn.benchmark = True
+
+    # Pre-compute snapshot steps for phase 2
+    snapshot_steps = set(
+        range(cfg.loo_initial_iters, cfg.loo_total_iters, cfg.loo_snapshot_interval)
+    )
+
+    all_indices = list(range(n_images))
 
     for left_out_idx in range(n_images):
         name = Path(image_paths[left_out_idx]).stem
         print(f"\nLeave-one-out: excluding view {left_out_idx} ({name})")
 
         train_indices = [j for j in range(n_images) if j != left_out_idx]
-        clean_image = gt_images[left_out_idx].to(device)
+        clean_cpu = gt_images_render[left_out_idx]
 
         model = GaussianModel(gaussians_init, device)
         optimizers = model.setup_optimizers(cfg)
         strategy, strategy_state = model.setup_strategy(cfg, scene_scale=1.0)
 
-        # Phase 1: Train without left-out view
-        print(f"  Phase 1: training on {len(train_indices)} views for {cfg.loo_initial_iters} iters...")
-        for step in range(cfg.loo_initial_iters):
-            idx = train_indices[step % len(train_indices)]
-            w2c = torch.linalg.inv(poses[idx]).to(device)
-            K = intrinsics[idx].to(device)
-            gt = gt_images[idx].to(device)
+        w2c_lo = w2c_all[left_out_idx]
+        K_lo = K_all[left_out_idx]
 
-            result = model.render_for_optim(w2c, K, H, W, strategy, strategy_state, step)
-            loss = reconstruction_loss(result["image"], gt, ssim_fn, cfg=cfg)
+        for step in tqdm(range(cfg.loo_total_iters), desc=f"  LOO {left_out_idx}"):
+            # Phase 1: train without left-out view; Phase 2: all views
+            if step < cfg.loo_initial_iters:
+                idx = train_indices[step % len(train_indices)]
+            else:
+                idx = all_indices[step % n_images]
+
+            # Train at reduced resolution (L1-only — SSIM conv2d overhead not needed
+            # for generating corruption patterns, paper doesn't specify LOO loss)
+            result = model.render_for_optim(
+                w2c_all[idx], loo_K_all[idx], loo_H, loo_W,
+                strategy, strategy_state, step,
+                render_mode="RGB",
+            )
+            loss = F.l1_loss(result["image"], gt_gpu_loo[idx])
             loss.backward()
             model.step_post_backward(step, result["meta"])
             model.optimizer_step()
 
-        # Snapshot: render left-out view as early corrupted
-        with torch.no_grad():
-            w2c_lo = torch.linalg.inv(poses[left_out_idx]).to(device)
-            K_lo = intrinsics[left_out_idx].to(device)
-            r = model.render(w2c_lo, K_lo, H, W)
-            corrupted_early = r["image"].clamp(0, 1).cpu()
-            all_pairs.append((corrupted_early, gt_images[left_out_idx]))
-
-        # Phase 2: Re-add left-out view, continue training
-        # Paper (Sec 4.2): "by initially excluding an image and later reintroducing it,
-        # we generate progressively refined corrupted images, improving the repair model's
-        # ability to handle the final 3DGS optimization." The full spectrum from heavily
-        # corrupted to nearly clean is intentional — teaches the model to handle all
-        # corruption levels encountered during Stage 1 optimization.
-        print(f"  Phase 2: re-adding view, training to {cfg.loo_total_iters} iters...")
-        all_indices = list(range(n_images))
-        for step in range(cfg.loo_initial_iters, cfg.loo_total_iters):
-            idx = all_indices[step % n_images]
-            w2c = torch.linalg.inv(poses[idx]).to(device)
-            K = intrinsics[idx].to(device)
-            gt = gt_images[idx].to(device)
-
-            result = model.render_for_optim(w2c, K, H, W, strategy, strategy_state, step)
-            loss = reconstruction_loss(result["image"], gt, ssim_fn, cfg=cfg)
-            loss.backward()
-            model.step_post_backward(step, result["meta"])
-            model.optimizer_step()
-
-            # Snapshot intermediate renders of left-out view
-            if (step - cfg.loo_initial_iters) % cfg.loo_snapshot_interval == 0:
+            # Snapshot at phase boundary and periodically during phase 2
+            # Full resolution — these become the actual repair training pairs
+            if step == cfg.loo_initial_iters or step in snapshot_steps:
                 with torch.no_grad():
                     r = model.render(w2c_lo, K_lo, H, W)
                     corrupted = r["image"].clamp(0, 1).cpu()
-                    all_pairs.append((corrupted, gt_images[left_out_idx]))
+                    all_pairs.append((corrupted, clean_cpu))
 
         del model
         torch.cuda.empty_cache()
@@ -164,8 +175,43 @@ def generate_all_scenes_data(cfg: RI3DConfig):
         generate_leave_one_out_data(scene_cfg)
 
 
+def _resize_and_crop_pair(corrupted: torch.Tensor, clean: torch.Tensor,
+                           size: int = 512) -> tuple[torch.Tensor, torch.Tensor]:
+    """Resize so smallest dim = size, then random crop to size x size.
+
+    Per paper: "we resize the input images during fine-tuning so that their smallest
+    dimension is 512 pixels, followed by random 512x512 cropping."
+
+    Both tensors must be (H, W, 3). Returns (3, size, size) tensors.
+    """
+    H, W = corrupted.shape[:2]
+    # Resize keeping aspect ratio so smallest dim = size
+    if H < W:
+        new_h, new_w = size, int(W * size / H)
+    else:
+        new_w, new_h = size, int(H * size / W)
+
+    corrupted_r = F.interpolate(
+        corrupted.permute(2, 0, 1).unsqueeze(0), size=(new_h, new_w),
+        mode="bilinear", align_corners=False
+    ).squeeze(0)
+    clean_r = F.interpolate(
+        clean.permute(2, 0, 1).unsqueeze(0), size=(new_h, new_w),
+        mode="bilinear", align_corners=False
+    ).squeeze(0)
+
+    # Random crop (same location for both)
+    y = random.randint(0, max(0, new_h - size))
+    x = random.randint(0, max(0, new_w - size))
+    return (corrupted_r[:, y:y+size, x:x+size],
+            clean_r[:, y:y+size, x:x+size])
+
+
 def train_repair_model(cfg: RI3DConfig, shared_components=None):
-    """Train a per-scene repair model on this scene's leave-one-out data.
+    """Train a per-scene repair model (ControlNet LoRA) on this scene's leave-one-out data.
+
+    Per the paper: fine-tune the ControlNet on corrupted/clean pairs so it learns
+    scene-specific repair. The UNet stays frozen.
 
     Args:
         cfg: scene config
@@ -219,13 +265,17 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
         text_embeds = shared_components["text_embeds"]
         noise_scheduler = shared_components["noise_scheduler"]
 
-    # Fresh ControlNet + LoRA for this scene
+    # Fresh ControlNet + LoRA for this scene (UNet stays frozen)
     controlnet = ControlNetModel.from_pretrained(cfg.controlnet_model,
-                                                  torch_dtype=dtype).to(device)
+                                                  torch_dtype=dtype, use_safetensors=False).to(device)
     lora_config = LoraConfig(
         r=cfg.repair_lora_rank,
         lora_alpha=cfg.repair_lora_rank,
-        target_modules=["to_q", "to_v", "to_k", "to_out.0"],
+        target_modules=[
+            "to_q", "to_v", "to_k", "to_out.0",  # attention
+            "conv1", "conv2",                       # resnet convolutions
+            "proj_in", "proj_out",                  # transformer projections
+        ],
         lora_dropout=0.0,
     )
     controlnet = get_peft_model(controlnet, lora_config)
@@ -240,15 +290,10 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
     for step in tqdm(range(n_iters), desc=f"Repair [{cfg.scene_name}]"):
         corrupted, clean = random.choice(all_pairs)
 
-        corrupted_512 = F.interpolate(
-            corrupted.permute(2, 0, 1).unsqueeze(0), size=(512, 512),
-            mode="bilinear", align_corners=False
-        ).to(device, dtype)
-
-        clean_512 = F.interpolate(
-            clean.permute(2, 0, 1).unsqueeze(0), size=(512, 512),
-            mode="bilinear", align_corners=False
-        ).to(device, dtype)
+        # Proper resize + random crop (paper: smallest dim = 512, then 512x512 crop)
+        corrupted_512, clean_512 = _resize_and_crop_pair(corrupted, clean)
+        corrupted_512 = corrupted_512.unsqueeze(0).to(device, dtype)
+        clean_512 = clean_512.unsqueeze(0).to(device, dtype)
 
         with torch.no_grad():
             clean_latent = vae.encode(clean_512 * 2 - 1).latent_dist.sample() * vae.config.scaling_factor
@@ -299,12 +344,33 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
     torch.cuda.empty_cache()
 
 
+def _prepare_for_pipeline(image: Image.Image, target_short_side: int = 512) -> tuple[Image.Image, int, int]:
+    """Resize preserving aspect ratio for pipeline input.
+
+    Matches the training preprocessing: smallest dim → target_short_side,
+    then dims rounded to multiples of 8 for the VAE.
+    Returns (resized_pil, pipe_h, pipe_w).
+    """
+    W_orig, H_orig = image.size
+    if H_orig <= W_orig:
+        pipe_h = target_short_side
+        pipe_w = int(W_orig * target_short_side / H_orig)
+    else:
+        pipe_w = target_short_side
+        pipe_h = int(H_orig * target_short_side / W_orig)
+    # Round to multiples of 8 (VAE latent alignment)
+    pipe_h = (pipe_h // 8) * 8
+    pipe_w = (pipe_w // 8) * 8
+    resized = image.resize((pipe_w, pipe_h), Image.LANCZOS)
+    return resized, pipe_h, pipe_w
+
+
 def test_repair_model(cfg: RI3DConfig):
     """Test the trained repair model on corrupted images from this scene."""
     from diffusers import (
         StableDiffusionControlNetPipeline,
         ControlNetModel,
-        LCMScheduler,
+        DPMSolverMultistepScheduler,
     )
     from peft import PeftModel
 
@@ -323,7 +389,7 @@ def test_repair_model(cfg: RI3DConfig):
 
     model_dir = cfg.scene_output_dir() / "repair_model"
     print("Loading repair pipeline for test...")
-    controlnet = ControlNetModel.from_pretrained(cfg.controlnet_model, torch_dtype=dtype)
+    controlnet = ControlNetModel.from_pretrained(cfg.controlnet_model, torch_dtype=dtype, use_safetensors=False)
     controlnet = PeftModel.from_pretrained(controlnet, model_dir)
     controlnet = controlnet.merge_and_unload()
 
@@ -331,9 +397,8 @@ def test_repair_model(cfg: RI3DConfig):
         cfg.sd_model, controlnet=controlnet, torch_dtype=dtype,
     ).to(device)
 
-    pipe.scheduler = LCMScheduler.from_config(pipe.scheduler.config)
-    pipe.load_lora_weights(cfg.lcm_lora)
-    pipe.fuse_lora()
+    pipe.scheduler = DPMSolverMultistepScheduler.from_config(
+        pipe.scheduler.config, use_karras_sigmas=True)
     pipe.safety_checker = None
 
     n_test = min(4, len(pairs))
@@ -347,15 +412,23 @@ def test_repair_model(cfg: RI3DConfig):
 
         corrupted_pil = Image.fromarray(
             (corrupted.numpy() * 255).astype(np.uint8)
-        ).resize((512, 512), Image.LANCZOS)
+        )
+        corrupted_resized, pipe_h, pipe_w = _prepare_for_pipeline(corrupted_pil)
 
         with torch.no_grad():
             result = pipe(
                 prompt="",
-                image=corrupted_pil,
-                num_inference_steps=cfg.lcm_inference_steps,
-                guidance_scale=cfg.lcm_guidance_scale,
+                image=corrupted_resized,
+                height=pipe_h,
+                width=pipe_w,
+                num_inference_steps=cfg.repair_inference_steps,
+                guidance_scale=cfg.repair_guidance_scale,
+                controlnet_conditioning_scale=cfg.repair_controlnet_scale,
             ).images[0]
+
+        # Resize result back to original pair resolution for comparison
+        H_orig, W_orig = corrupted.shape[:2]
+        result = result.resize((W_orig, H_orig), Image.LANCZOS)
 
         axes[0, j].imshow(corrupted.numpy())
         axes[0, j].set_title("Corrupted")

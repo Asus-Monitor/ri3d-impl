@@ -90,12 +90,16 @@ class GaussianModel:
 
     def render_for_optim(self, w2c: torch.Tensor, K: torch.Tensor, H: int, W: int,
                           strategy: DefaultStrategy, strategy_state: dict, step: int,
-                          bg_color: torch.Tensor | None = None) -> dict:
+                          bg_color: torch.Tensor | None = None,
+                          render_mode: str = "RGB+D") -> dict:
         """Render with densification hooks for optimization (input views only).
 
         Calls strategy.step_pre_backward to accumulate gradient statistics
         for adaptive density control (splitting/cloning/pruning).
         Only use this for input views with real ground truth.
+
+        Args:
+            render_mode: "RGB+D" (default) includes depth, "RGB" skips it for speed.
         """
         viewmats = w2c.unsqueeze(0).to(self.device)
         Ks = K.unsqueeze(0).to(self.device)
@@ -113,19 +117,21 @@ class GaussianModel:
             sh_degree=None,
             packed=True,
             near_plane=0.01, far_plane=1000.0,
-            render_mode="RGB+D",
+            render_mode=render_mode,
             backgrounds=backgrounds,
         )
 
         # Pre-backward hook for densification statistics
         strategy.step_pre_backward(self.params, self._optimizers, strategy_state, step, meta)
 
-        return {
+        result = {
             "image": render_colors[0, :, :, :3],
             "alpha": render_alphas[0],
-            "depth": render_colors[0, :, :, 3:4],
             "meta": meta,
         }
+        if render_mode == "RGB+D":
+            result["depth"] = render_colors[0, :, :, 3:4]
+        return result
 
     def render_for_loss(self, w2c: torch.Tensor, K: torch.Tensor, H: int, W: int,
                          bg_color: torch.Tensor | None = None) -> dict:

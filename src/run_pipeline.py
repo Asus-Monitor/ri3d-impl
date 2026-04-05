@@ -180,7 +180,7 @@ def run_train_models(cfg: RI3DConfig):
     print(f"  Training per-scene models ({len(ready)} scenes)")
     print(f"{'='*60}")
 
-    # --- Step 5: Repair models (share SD 1.5 components) ---
+    # --- Step 5: Repair models (share frozen VAE + UNet across scenes) ---
     need_repair = [sc for sc in ready
                    if not (sc.scene_output_dir() / "repair_model").exists()]
     if need_repair:

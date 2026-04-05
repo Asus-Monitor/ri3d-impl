@@ -117,7 +117,11 @@ def train_inpainting_model(cfg: RI3DConfig, shared_components=None):
     lora_config = LoraConfig(
         r=cfg.inpainting_lora_rank,
         lora_alpha=cfg.inpainting_lora_rank,
-        target_modules=["to_q", "to_v", "to_k", "to_out.0"],
+        target_modules=[
+            "to_q", "to_v", "to_k", "to_out.0",  # attention
+            "conv1", "conv2", "conv_in", "conv_out", # resnet + input/output convolutions
+            "proj_in", "proj_out",                  # transformer projections
+        ],
         lora_dropout=0.0,
     )
     unet = get_peft_model(unet, lora_config)
@@ -168,6 +172,7 @@ def train_inpainting_model(cfg: RI3DConfig, shared_components=None):
         if (step + 1) % 100 == 0:
             avg_loss = sum(losses[-100:]) / 100
             print(f"  Step {step+1}: loss = {avg_loss:.6f}")
+
 
     unet.save_pretrained(model_dir)
     print(f"Saved inpainting model to {model_dir}")

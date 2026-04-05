@@ -34,11 +34,11 @@ from step4_gaussian_init import generate_elliptical_cameras
 
 
 def load_repair_pipeline(cfg: RI3DConfig):
-    """Load the trained repair model for inference (per-scene LoRA)."""
+    """Load the trained repair model for inference (per-scene ControlNet LoRA)."""
     from diffusers import (
         StableDiffusionControlNetPipeline,
         ControlNetModel,
-        LCMScheduler,
+        DPMSolverMultistepScheduler,
     )
     from peft import PeftModel
 
@@ -46,19 +46,16 @@ def load_repair_pipeline(cfg: RI3DConfig):
     dtype = cfg.dtype
     device = cfg.device
 
-    controlnet = ControlNetModel.from_pretrained(cfg.controlnet_model, torch_dtype=dtype)
+    controlnet = ControlNetModel.from_pretrained(cfg.controlnet_model, torch_dtype=dtype, use_safetensors=False)
     controlnet = PeftModel.from_pretrained(controlnet, model_dir)
-    # Merge LoRA weights into base model so isinstance(controlnet, ControlNetModel)
-    # passes the type check in the diffusers pipeline
     controlnet = controlnet.merge_and_unload()
 
     pipe = StableDiffusionControlNetPipeline.from_pretrained(
         cfg.sd_model, controlnet=controlnet, torch_dtype=dtype,
     ).to(device)
 
-    pipe.scheduler = LCMScheduler.from_config(pipe.scheduler.config)
-    pipe.load_lora_weights(cfg.lcm_lora)
-    pipe.fuse_lora()
+    pipe.scheduler = DPMSolverMultistepScheduler.from_config(
+        pipe.scheduler.config, use_karras_sigmas=True)
     pipe.safety_checker = None
 
     return pipe
@@ -73,18 +70,24 @@ def repair_image(pipe, image_tensor: torch.Tensor, cfg: RI3DConfig) -> torch.Ten
     Returns:
         repaired: (H, W, 3) float tensor in [0, 1]
     """
+    from step5_repair_model import _prepare_for_pipeline
+
     H, W = image_tensor.shape[:2]
 
-    # Convert to PIL at 512x512
+    # Convert to PIL, preserving aspect ratio (matches training preprocessing)
     img_np = (image_tensor.clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
-    img_pil = Image.fromarray(img_np).resize((512, 512), Image.LANCZOS)
+    img_pil = Image.fromarray(img_np)
+    img_resized, pipe_h, pipe_w = _prepare_for_pipeline(img_pil)
 
     with torch.no_grad():
         result = pipe(
             prompt="",
-            image=img_pil,
-            num_inference_steps=cfg.lcm_inference_steps,
-            guidance_scale=cfg.lcm_guidance_scale,
+            image=img_resized,
+            height=pipe_h,
+            width=pipe_w,
+            num_inference_steps=cfg.repair_inference_steps,
+            guidance_scale=cfg.repair_guidance_scale,
+            controlnet_conditioning_scale=cfg.repair_controlnet_scale,
         ).images[0]
 
     # Convert back to tensor at original resolution

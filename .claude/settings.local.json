@@ -8,7 +8,9 @@
       "WebFetch(domain:github.com)",
       "Bash(7z l:*)",
       "Bash(chmod +x:*)",
-      "Bash(grep -P '^[^/]+/images/$')"
+      "Bash(grep -P '^[^/]+/images/$')",
+      "WebSearch",
+      "WebFetch(domain:arxiv.org)"
     ]
   }
 }
