@@ -36,7 +36,7 @@ from step4_gaussian_init import generate_elliptical_cameras
 def load_repair_pipeline(cfg: RI3DConfig):
     """Load the trained repair model for inference (per-scene ControlNet LoRA)."""
     from diffusers import (
-        StableDiffusionControlNetPipeline,
+        StableDiffusionControlNetImg2ImgPipeline,
         ControlNetModel,
         DPMSolverMultistepScheduler,
     )
@@ -50,7 +50,7 @@ def load_repair_pipeline(cfg: RI3DConfig):
     controlnet = PeftModel.from_pretrained(controlnet, model_dir)
     controlnet = controlnet.merge_and_unload()
 
-    pipe = StableDiffusionControlNetPipeline.from_pretrained(
+    pipe = StableDiffusionControlNetImg2ImgPipeline.from_pretrained(
         cfg.sd_model, controlnet=controlnet, torch_dtype=dtype,
     ).to(device)
 
@@ -83,8 +83,8 @@ def repair_image(pipe, image_tensor: torch.Tensor, cfg: RI3DConfig) -> torch.Ten
         result = pipe(
             prompt="",
             image=img_resized,
-            height=pipe_h,
-            width=pipe_w,
+            control_image=img_resized,
+            strength=cfg.repair_strength,
             num_inference_steps=cfg.repair_inference_steps,
             guidance_scale=cfg.repair_guidance_scale,
             controlnet_conditioning_scale=cfg.repair_controlnet_scale,

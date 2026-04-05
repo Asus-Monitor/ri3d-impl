@@ -368,7 +368,7 @@ def _prepare_for_pipeline(image: Image.Image, target_short_side: int = 512) -> t
 def test_repair_model(cfg: RI3DConfig):
     """Test the trained repair model on corrupted images from this scene."""
     from diffusers import (
-        StableDiffusionControlNetPipeline,
+        StableDiffusionControlNetImg2ImgPipeline,
         ControlNetModel,
         DPMSolverMultistepScheduler,
     )
@@ -393,7 +393,7 @@ def test_repair_model(cfg: RI3DConfig):
     controlnet = PeftModel.from_pretrained(controlnet, model_dir)
     controlnet = controlnet.merge_and_unload()
 
-    pipe = StableDiffusionControlNetPipeline.from_pretrained(
+    pipe = StableDiffusionControlNetImg2ImgPipeline.from_pretrained(
         cfg.sd_model, controlnet=controlnet, torch_dtype=dtype,
     ).to(device)
 
@@ -419,8 +419,8 @@ def test_repair_model(cfg: RI3DConfig):
             result = pipe(
                 prompt="",
                 image=corrupted_resized,
-                height=pipe_h,
-                width=pipe_w,
+                control_image=corrupted_resized,
+                strength=cfg.repair_strength,
                 num_inference_steps=cfg.repair_inference_steps,
                 guidance_scale=cfg.repair_guidance_scale,
                 controlnet_conditioning_scale=cfg.repair_controlnet_scale,

@@ -10,7 +10,8 @@
       "Bash(chmod +x:*)",
       "Bash(grep -P '^[^/]+/images/$')",
       "WebSearch",
-      "WebFetch(domain:arxiv.org)"
+      "WebFetch(domain:arxiv.org)",
+      "Bash(python3:*)"
     ]
   }
 }

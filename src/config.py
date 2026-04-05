@@ -50,6 +50,7 @@ class RI3DConfig:
     repair_inference_steps: int = 15   # DPM++ 2M Karras (no LCM for ControlNet)
     repair_guidance_scale: float = 1.0  # low CFG — repair should preserve structure, not hallucinate
     repair_controlnet_scale: float = 1.0  # ControlNet conditioning strength
+    repair_strength: float = 0.75       # img2img denoising strength (0=no change, 1=full regeneration)
 
     # LCM (used for inpainting only — incompatible with ControlNet)
     lcm_lora: str = "latent-consistency/lcm-lora-sdv1-5"
