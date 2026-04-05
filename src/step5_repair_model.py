@@ -269,6 +269,44 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
         text_embeds = shared_components["text_embeds"]
         noise_scheduler = shared_components["noise_scheduler"]
 
+    # ------------------------------------------------------------------
+    # Pre-compute: resize pairs, move to GPU, pre-encode clean latents.
+    # Eliminates per-step VAE encode + CPU resize + CPU→GPU transfer.
+    # ------------------------------------------------------------------
+    torch.backends.cudnn.benchmark = True
+    latent_crop = 64  # 512px // 8 (VAE downscale)
+    pair_corrupted_gpu = []   # (3, H, W) on GPU, dims rounded to 8
+    pair_clean_lat_gpu = []   # (4, H//8, W//8) pre-encoded latents
+
+    with torch.no_grad():
+        for corrupted, clean in all_pairs:
+            H, W = corrupted.shape[:2]
+            if H < W:
+                new_h, new_w = 512, int(W * 512 / H)
+            else:
+                new_w, new_h = 512, int(H * 512 / W)
+            new_h = (new_h // 8) * 8
+            new_w = (new_w // 8) * 8
+
+            corrupted_r = F.interpolate(
+                corrupted.permute(2, 0, 1).unsqueeze(0), size=(new_h, new_w),
+                mode="bilinear", align_corners=False,
+            ).squeeze(0).to(device, dtype)
+            clean_r = F.interpolate(
+                clean.permute(2, 0, 1).unsqueeze(0), size=(new_h, new_w),
+                mode="bilinear", align_corners=False,
+            ).squeeze(0).to(device, dtype)
+
+            clean_lat = vae.encode(
+                clean_r.unsqueeze(0) * 2 - 1
+            ).latent_dist.sample() * vae.config.scaling_factor
+
+            pair_corrupted_gpu.append(corrupted_r)
+            pair_clean_lat_gpu.append(clean_lat.squeeze(0))
+
+    n_pairs = len(pair_corrupted_gpu)
+    print(f"Pre-encoded {n_pairs} pairs on GPU")
+
     # Fresh ControlNet + LoRA for this scene (UNet stays frozen)
     controlnet = ControlNetModel.from_pretrained(cfg.controlnet_model,
                                                   torch_dtype=dtype, use_safetensors=False).to(device)
@@ -288,54 +326,90 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
     optimizer = torch.optim.AdamW(controlnet.parameters(), lr=cfg.repair_lr, weight_decay=1e-2)
 
     n_iters = cfg.repair_train_iters
-    print(f"Training ControlNet LoRA for {n_iters} iterations on {len(all_pairs)} pairs...")
+    max_t = noise_scheduler.config.num_train_timesteps
+    inference_max_t = int(max_t * cfg.repair_strength)
+
+    # Scale batch size to GPU memory
+    gpu_mem_gb = torch.cuda.get_device_properties(device).total_memory / (1024 ** 3)
+    if gpu_mem_gb >= 20:
+        batch_size = 4
+    elif gpu_mem_gb >= 12:
+        batch_size = 2
+    else:
+        batch_size = 1
+    n_steps = (n_iters + batch_size - 1) // batch_size
+    text_embeds_b = text_embeds.expand(batch_size, -1, -1)
+
+    print(f"Training ControlNet LoRA for {n_iters} iterations (batch={batch_size}) "
+          f"on {n_pairs} pairs...")
     losses = []
+    iter_count = 0
 
-    for step in tqdm(range(n_iters), desc=f"Repair [{cfg.scene_name}]"):
-        corrupted, clean = random.choice(all_pairs)
+    for step in tqdm(range(n_steps), desc=f"Repair [{cfg.scene_name}]"):
+        actual_bs = min(batch_size, n_iters - iter_count)
+        if actual_bs <= 0:
+            break
 
-        # Proper resize + random crop (paper: smallest dim = 512, then 512x512 crop)
-        corrupted_512, clean_512 = _resize_and_crop_pair(corrupted, clean)
-        corrupted_512 = corrupted_512.unsqueeze(0).to(device, dtype)
-        clean_512 = clean_512.unsqueeze(0).to(device, dtype)
+        corrupted_crops = []
+        noisy_lats = []
+        noises = []
+        ts = []
 
-        with torch.no_grad():
-            clean_latent = vae.encode(clean_512 * 2 - 1).latent_dist.sample() * vae.config.scaling_factor
+        for _ in range(actual_bs):
+            idx = random.randint(0, n_pairs - 1)
+            c_full = pair_corrupted_gpu[idx]
+            cl_full = pair_clean_lat_gpu[idx]
+            _, h, w = c_full.shape
 
-        noise = torch.randn_like(clean_latent)
-        # Bias timestep sampling toward the img2img inference range [0, T*strength].
-        # 80% of samples from the inference range, 20% from the full range for robustness.
-        max_t = noise_scheduler.config.num_train_timesteps
-        inference_max_t = int(max_t * cfg.repair_strength)
-        if random.random() < 0.8:
-            t = torch.randint(0, inference_max_t, (1,), device=device).long()
-        else:
-            t = torch.randint(0, max_t, (1,), device=device).long()
-        noisy_latent = noise_scheduler.add_noise(clean_latent, noise, t)
+            # Random crop aligned to 8px for exact latent correspondence
+            x0 = random.randint(0, max(0, (w - 512) // 8)) * 8
+            y0 = random.randint(0, max(0, (h - 512) // 8)) * 8
+            lx, ly = x0 // 8, y0 // 8
+
+            corrupted_crops.append(c_full[:, y0:y0+512, x0:x0+512].unsqueeze(0))
+            clean_lat = cl_full[:, ly:ly+latent_crop, lx:lx+latent_crop].unsqueeze(0)
+
+            noise = torch.randn_like(clean_lat)
+            # Bias timestep sampling toward the img2img inference range
+            if random.random() < 0.8:
+                t = torch.randint(0, inference_max_t, (1,), device=device).long()
+            else:
+                t = torch.randint(0, max_t, (1,), device=device).long()
+
+            # Standard training per paper: noise clean latent, predict epsilon.
+            # ControlNet condition (corrupted image) teaches the mapping.
+            noisy_lats.append(noise_scheduler.add_noise(clean_lat, noise, t))
+            noises.append(noise)
+            ts.append(t)
+
+        corrupted_b = torch.cat(corrupted_crops)
+        noisy_lat_b = torch.cat(noisy_lats)
+        noise_b = torch.cat(noises)
+        t_b = torch.cat(ts)
 
         controlnet_output = controlnet(
-            noisy_latent, t, encoder_hidden_states=text_embeds,
-            controlnet_cond=corrupted_512,
+            noisy_lat_b, t_b, encoder_hidden_states=text_embeds_b[:actual_bs],
+            controlnet_cond=corrupted_b,
             return_dict=False,
         )
-        down_block_res_samples = controlnet_output[0]
-        mid_block_res_sample = controlnet_output[1]
 
         noise_pred = unet(
-            noisy_latent, t, encoder_hidden_states=text_embeds,
-            down_block_additional_residuals=down_block_res_samples,
-            mid_block_additional_residual=mid_block_res_sample,
+            noisy_lat_b, t_b, encoder_hidden_states=text_embeds_b[:actual_bs],
+            down_block_additional_residuals=controlnet_output[0],
+            mid_block_additional_residual=controlnet_output[1],
         ).sample
 
-        loss = F.mse_loss(noise_pred.float(), noise.float())
+        loss = F.mse_loss(noise_pred.float(), noise_b.float())
         loss.backward()
         optimizer.step()
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
 
+        iter_count += actual_bs
         losses.append(loss.item())
-        if (step + 1) % 100 == 0:
-            avg_loss = sum(losses[-100:]) / 100
-            print(f"  Step {step+1}: loss = {avg_loss:.6f}")
+        if iter_count % 100 < batch_size or step == n_steps - 1:
+            recent = losses[-max(1, 100 // batch_size):]
+            avg_loss = sum(recent) / len(recent)
+            print(f"  Step ~{min(iter_count, n_iters)}: loss = {avg_loss:.6f}")
 
     controlnet.save_pretrained(model_dir)
     print(f"Saved repair model to {model_dir}")
@@ -348,7 +422,7 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
     fig.savefig(model_dir / "training_loss.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
 
-    del controlnet, optimizer
+    del controlnet, optimizer, pair_corrupted_gpu, pair_clean_lat_gpu
     if _owns_components:
         del text_encoder, vae, unet
     torch.cuda.empty_cache()

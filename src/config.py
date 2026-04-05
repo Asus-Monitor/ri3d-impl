@@ -44,9 +44,9 @@ class RI3DConfig:
     # Repair model (ControlNet + UNet LoRA, DPM++ scheduler)
     sd_model: str = "stable-diffusion-v1-5/stable-diffusion-v1-5"
     controlnet_model: str = "lllyasviel/control_v11f1e_sd15_tile"
-    repair_train_iters: int = 2000  # paper Sec 8.1: "fine-tune for 1800 iterations"
+    repair_train_iters: int = 200 # paper Sec 8.1: "fine-tune for 1800 iterations"
     repair_lr: float = 1e-4
-    repair_lora_rank: int = 88
+    repair_lora_rank: int = 96
     repair_inference_steps: int = 15   # DPM++ 2M Karras (no LCM for ControlNet)
     repair_guidance_scale: float = 1.0  # low CFG — repair should preserve structure, not hallucinate
     repair_controlnet_scale: float = 1.0  # ControlNet conditioning strength
