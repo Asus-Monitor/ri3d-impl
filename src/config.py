@@ -44,13 +44,13 @@ class RI3DConfig:
     # Repair model (ControlNet + UNet LoRA, DPM++ scheduler)
     sd_model: str = "stable-diffusion-v1-5/stable-diffusion-v1-5"
     controlnet_model: str = "lllyasviel/control_v11f1e_sd15_tile"
-    repair_train_iters: int = 200
+    repair_train_iters: int = 2000  # paper Sec 8.1: "fine-tune for 1800 iterations"
     repair_lr: float = 1e-4
-    repair_lora_rank: int = 64
+    repair_lora_rank: int = 88
     repair_inference_steps: int = 15   # DPM++ 2M Karras (no LCM for ControlNet)
     repair_guidance_scale: float = 1.0  # low CFG — repair should preserve structure, not hallucinate
     repair_controlnet_scale: float = 1.0  # ControlNet conditioning strength
-    repair_strength: float = 0.6        # img2img denoising strength (0=no change, 1=full regeneration)
+    repair_strength: float = 0.675        # img2img denoising strength (0=no change, 1=full regeneration)
 
     # LCM (used for inpainting only — incompatible with ControlNet)
     lcm_lora: str = "latent-consistency/lcm-lora-sdv1-5"
@@ -61,7 +61,7 @@ class RI3DConfig:
     # Leave-one-out training for repair
     loo_initial_iters: int = 6000  # iters before re-adding left-out view
     loo_total_iters: int = 10000   # total iters for leave-one-out 3DGS
-    loo_snapshot_interval: int = 1000  # snapshot corrupted renders every N iters after re-add
+    loo_snapshot_interval: int = 500   # snapshot corrupted renders every N iters after re-add
     loo_render_scale: float = 0.5     # train LOO 3DGS at lower res for speed (snapshots use full res)
 
     # Inpainting model

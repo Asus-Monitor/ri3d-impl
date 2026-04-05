@@ -79,8 +79,12 @@ def generate_leave_one_out_data(cfg: RI3DConfig):
 
     torch.backends.cudnn.benchmark = True
 
-    # Pre-compute snapshot steps for phase 2
-    snapshot_steps = set(
+    # Pre-compute snapshot steps:
+    #  - Phase 1 (before re-add): a few early snapshots to capture severe corruption
+    #    that the repair model will encounter during early Stage 1 optimization
+    #  - Phase 2 (after re-add): progressively refined snapshots per paper Sec 4.2
+    phase1_snapshots = {cfg.loo_initial_iters // 2, cfg.loo_initial_iters - 1}
+    snapshot_steps = phase1_snapshots | set(
         range(cfg.loo_initial_iters, cfg.loo_total_iters, cfg.loo_snapshot_interval)
     )
 
@@ -119,9 +123,9 @@ def generate_leave_one_out_data(cfg: RI3DConfig):
             model.step_post_backward(step, result["meta"])
             model.optimizer_step()
 
-            # Snapshot at phase boundary and periodically during phase 2
+            # Snapshot at key points during both phases
             # Full resolution — these become the actual repair training pairs
-            if step == cfg.loo_initial_iters or step in snapshot_steps:
+            if step in snapshot_steps:
                 with torch.no_grad():
                     r = model.render(w2c_lo, K_lo, H, W)
                     corrupted = r["image"].clamp(0, 1).cpu()

@@ -105,9 +105,10 @@ def inpaint_missing_regions(pipe, rendered_image: torch.Tensor,
     result_np = np.array(result.resize((W, H), Image.LANCZOS)).astype(np.float32) / 255.0
     inpainted = torch.from_numpy(result_np).to(rendered_image.device)
 
-    # Composite: keep visible regions from render, use inpainted for missing
-    alpha_3ch = alpha_mask.unsqueeze(-1)
-    composite = rendered_image * alpha_3ch + inpainted * (1 - alpha_3ch)
+    # Composite: keep non-missing regions from render, use inpainted only for
+    # missing background holes.  Per paper: missing = (1 - M_α) ⊙ M_b
+    missing_3ch = missing.unsqueeze(-1)
+    composite = rendered_image * (1 - missing_3ch) + inpainted * missing_3ch
 
     return composite
 
@@ -142,7 +143,7 @@ def estimate_mono_depth(image_tensor: torch.Tensor, cfg: RI3DConfig) -> torch.Te
         mono.unsqueeze(0).unsqueeze(0).float(),
         size=(H, W), mode="bilinear", align_corners=False,
     ).squeeze()
-    return mono
+    return mono.to(image_tensor.device)
 
 
 def clear_mono_depth_cache():
@@ -248,30 +249,28 @@ def add_gaussians_to_model(model: GaussianModel, new_gaussians: dict):
 
 
 def select_inpaint_views(renders_cache: dict, n_views: int, k_inpaint: int,
-                          last_inpainted: set) -> list[int]:
-    """Select K views with largest missing regions, rotating to avoid always picking same views.
+                          cycle: int) -> list[int]:
+    """Select K views for inpainting using alternating even/odd pattern.
 
-    Per paper: "different subset of K images" each cycle, non-overlapping content.
+    Per paper Sec 8.3: 'sequentially inpaint and project every other view
+    (5 views)'.  Alternates between even and odd indices each cycle to ensure
+    non-overlapping coverage.  Views with negligible missing regions are skipped.
     """
-    # Score each view by missing area, penalize recently inpainted views
-    scores = {}
-    for j in range(n_views):
-        rc = renders_cache[j]
-        alpha_mask = rc["alpha_mask"]
-        bg_mask = rc["bg_mask"]
-        missing = ((1 - alpha_mask) * bg_mask).sum().item()
-        # Penalize recently inpainted views to encourage rotation
-        if j in last_inpainted:
-            missing *= 0.3
-        scores[j] = missing
+    if cycle % 2 == 0:
+        candidates = list(range(0, n_views, 2))   # [0, 2, 4, 6, 8]
+    else:
+        candidates = list(range(1, n_views, 2))   # [1, 3, 5, 7, 9]
 
-    # Pick top K by missing area
-    ranked = sorted(scores.keys(), key=lambda j: scores[j], reverse=True)
-    selected = ranked[:k_inpaint]
+    # Only include views with significant missing regions
+    selected = []
+    for j in candidates:
+        if j in renders_cache:
+            rc = renders_cache[j]
+            missing = ((1 - rc["alpha_mask"]) * rc["bg_mask"]).sum().item()
+            if missing > 100:
+                selected.append(j)
 
-    # Only inpaint views that actually have significant missing regions
-    selected = [j for j in selected if scores[j] > 100]
-    return selected
+    return selected[:k_inpaint]
 
 
 def run_stage2(cfg: RI3DConfig):
@@ -341,7 +340,7 @@ def run_stage2(cfg: RI3DConfig):
     pseudo_gt = [None] * cfg.stage2_num_novel_views
     inpainted_images = [None] * cfg.stage2_num_novel_views
     cached_bg_masks = [None] * cfg.stage2_num_novel_views
-    last_inpainted = set()  # track which views were inpainted last cycle
+    inpaint_cycle = 0  # alternating even/odd view selection per paper Sec 8.3
 
     plateau = PlateauDetector(cfg.plateau_window, cfg.plateau_threshold, cfg.plateau_min_iters)
     losses_history = []
@@ -375,15 +374,22 @@ def run_stage2(cfg: RI3DConfig):
                         "bg_mask": bg_mask,
                     }
 
-                # Phase 2: Inpaint selected views (before cutoff)
+                # Phase 2: Clear ALL inpainted images from previous cycle.
+                # Per paper, each cycle inpaints a fresh subset; stale images
+                # from prior cycles would prevent repair from seeing the current
+                # (improved) renders.
+                for j in range(cfg.stage2_num_novel_views):
+                    inpainted_images[j] = None
+
+                # Phase 3: Inpaint selected views (before cutoff)
                 do_inpaint = step < cfg.stage2_inpaint_cutoff
                 if do_inpaint:
-                    # Select K views with most missing content, rotating subsets
+                    # Per paper Sec 8.3: alternate even/odd view indices
                     inpaint_views = select_inpaint_views(
                         renders_cache, cfg.stage2_num_novel_views,
-                        cfg.stage2_num_inpaint_views, last_inpainted,
+                        cfg.stage2_num_inpaint_views, inpaint_cycle,
                     )
-                    last_inpainted = set(inpaint_views)
+                    inpaint_cycle += 1
 
                     if inpaint_views:
                         # Load inpaint pipeline on first use
@@ -391,6 +397,7 @@ def run_stage2(cfg: RI3DConfig):
                             print("  Loading inpainting pipeline...")
                             inpaint_pipe = load_inpainting_pipeline(cfg)
 
+                        any_added = False
                         for j in inpaint_views:
                             rc = renders_cache[j]
                             inpainted = inpaint_missing_regions(
@@ -408,14 +415,18 @@ def run_stage2(cfg: RI3DConfig):
                             if new_gs is not None:
                                 n_before = model.n_gaussians
                                 add_gaussians_to_model(model, new_gs)
-                                optimizers = model.setup_optimizers(cfg)
-                                strategy, strategy_state = model.setup_strategy(
-                                    cfg, scene_scale=scene_scale,
-                                )
+                                any_added = True
                                 print(f"    View {j}: +{model.n_gaussians - n_before} "
                                       f"Gaussians (total: {model.n_gaussians})")
+
+                        # Re-setup optimizers/strategy once after all additions
+                        if any_added:
+                            optimizers = model.setup_optimizers(cfg)
+                            strategy, strategy_state = model.setup_strategy(
+                                cfg, scene_scale=scene_scale,
+                            )
                 else:
-                    # Past cutoff — free inpaint + depth models
+                    # Past cutoff — permanently free inpaint + depth models
                     if inpaint_pipe is not None:
                         del inpaint_pipe
                         inpaint_pipe = None
@@ -423,35 +434,34 @@ def run_stage2(cfg: RI3DConfig):
                         torch.cuda.empty_cache()
                         print("  Freed inpainting + depth models (past cutoff)")
 
-                # Phase 3: Repair all novel views
+                # Phase 4: Repair all novel views
+                # Per paper: repair(inpainted) for this cycle's K views,
+                # repair(render) for all other views.
                 if repair_pipe is None:
                     print("  Loading repair pipeline...")
                     repair_pipe = load_repair_pipeline(cfg)
 
                 for j in range(cfg.stage2_num_novel_views):
                     rc = renders_cache[j]
-                    # Repair inpainted image if available, otherwise raw render
                     if inpainted_images[j] is not None:
                         repaired = repair_image(repair_pipe, inpainted_images[j], cfg)
                     else:
                         repaired = repair_image(repair_pipe, rc["image"], cfg)
                     pseudo_gt[j] = repaired.detach()
 
-                del renders_cache
+                torch.cuda.empty_cache()
 
-            # Save example renders (not every cycle — every 4th)
+            # Save example renders (reuse from refresh cache, every 4th cycle)
             if step % (cfg.stage2_inpaint_interval * 4) == 0:
                 for j in range(min(3, cfg.stage2_num_novel_views)):
-                    with torch.no_grad():
-                        r = model.render(novel_w2c[j], K_avg, H, W)
-
+                    rc = renders_cache[j]
                     n_cols = 4 if inpainted_images[j] is not None else 3
                     fig, axes = plt.subplots(1, n_cols, figsize=(5 * n_cols, 5))
-                    axes[0].imshow(r["image"].clamp(0,1).cpu().numpy())
+                    axes[0].imshow(rc["image"].clamp(0, 1).cpu().numpy())
                     axes[0].set_title(f"Rendered (step {step})")
                     axes[1].imshow(pseudo_gt[j].cpu().numpy())
                     axes[1].set_title("Pseudo GT")
-                    axes[2].imshow(r["alpha"].squeeze(-1).cpu().numpy(), cmap="gray")
+                    axes[2].imshow(rc["alpha"].squeeze(-1).cpu().numpy(), cmap="gray")
                     axes[2].set_title("Alpha")
                     if inpainted_images[j] is not None:
                         axes[3].imshow(inpainted_images[j].cpu().numpy())
@@ -460,6 +470,8 @@ def run_stage2(cfg: RI3DConfig):
                     fig.savefig(render_dir / f"step{step:05d}_novel{j}.png",
                                 dpi=120, bbox_inches="tight")
                     plt.close(fig)
+
+            del renders_cache
 
         total_loss = torch.tensor(0.0, device=device)
 
