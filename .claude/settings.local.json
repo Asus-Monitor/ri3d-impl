@@ -11,7 +11,8 @@
       "Bash(grep -P '^[^/]+/images/$')",
       "WebSearch",
       "WebFetch(domain:arxiv.org)",
-      "Bash(python3:*)"
+      "Bash(python3:*)",
+      "Bash(git show:*)"
     ]
   }
 }

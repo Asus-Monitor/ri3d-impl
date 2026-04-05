@@ -81,17 +81,23 @@ def inpaint_missing_regions(pipe, rendered_image: torch.Tensor,
     if missing.sum() < 100:
         return rendered_image.clone()
 
+    from step5_repair_model import _prepare_for_pipeline
+
     img_np = (rendered_image.clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
     mask_np = (missing.cpu().numpy() * 255).astype(np.uint8)
 
-    img_pil = Image.fromarray(img_np).resize((512, 512), Image.LANCZOS)
-    mask_pil = Image.fromarray(mask_np, mode="L").resize((512, 512), Image.NEAREST)
+    img_pil = Image.fromarray(img_np)
+    img_resized, pipe_h, pipe_w = _prepare_for_pipeline(img_pil)
+    mask_pil = Image.fromarray(mask_np, mode="L").resize((pipe_w, pipe_h), Image.NEAREST)
 
     with torch.no_grad():
         result = pipe(
             prompt="",
-            image=img_pil,
+            image=img_resized,
             mask_image=mask_pil,
+            height=pipe_h,
+            width=pipe_w,
+            strength=cfg.inpainting_strength,
             num_inference_steps=cfg.lcm_inference_steps,
             guidance_scale=cfg.lcm_guidance_scale,
         ).images[0]

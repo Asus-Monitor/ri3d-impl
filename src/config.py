@@ -55,7 +55,8 @@ class RI3DConfig:
     # LCM (used for inpainting only — incompatible with ControlNet)
     lcm_lora: str = "latent-consistency/lcm-lora-sdv1-5"
     lcm_inference_steps: int = 8
-    lcm_guidance_scale: float = 1.5
+    lcm_guidance_scale: float = 1.0   # no CFG amplification — empty prompt means no text direction
+    inpainting_strength: float = 0.85  # img2img strength — high since masked areas need full generation
 
     # Leave-one-out training for repair
     loo_initial_iters: int = 6000  # iters before re-adding left-out view
@@ -64,8 +65,8 @@ class RI3DConfig:
     loo_render_scale: float = 0.5     # train LOO 3DGS at lower res for speed (snapshots use full res)
 
     # Inpainting model
-    inpainting_train_iters: int = 2000
-    inpainting_lr: float = 1e-5
+    inpainting_train_iters: int = 50
+    inpainting_lr: float = 1e-4
     inpainting_lora_rank: int = 64
 
     # Stage 1 optimization

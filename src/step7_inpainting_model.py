@@ -111,15 +111,32 @@ def train_inpainting_model(cfg: RI3DConfig, shared_components=None):
         text_embeds = shared_components["text_embeds"]
         noise_scheduler = shared_components["noise_scheduler"]
 
+    # ------------------------------------------------------------------
+    # Cache image tensors on GPU to avoid PIL/numpy/CPU→GPU work per step.
+    # VAE encoding still happens per step on the actual crop (not pre-encoded)
+    # to avoid receptive-field artifacts from latent-space cropping.
+    # ------------------------------------------------------------------
+    torch.backends.cudnn.benchmark = True
+    vae.eval()
+    img_tensors_gpu = []  # (3, H, W) on GPU
+
+    for img_pil in scene_images:
+        w, h = img_pil.size
+        img_np = np.array(img_pil).astype(np.float32) / 255.0
+        img_t = torch.from_numpy(img_np).permute(2, 0, 1).to(device, dtype)
+        img_tensors_gpu.append(img_t)
+
+    n_images = len(img_tensors_gpu)
+
     # Fresh UNet + LoRA for this scene
     unet = UNet2DConditionModel.from_pretrained(inpaint_model_id, subfolder="unet",
                                                  torch_dtype=dtype).to(device)
+    unet = unet.to(memory_format=torch.channels_last)
     lora_config = LoraConfig(
         r=cfg.inpainting_lora_rank,
         lora_alpha=cfg.inpainting_lora_rank,
         target_modules=[
-            "to_q", "to_v", "to_k", "to_out.0",  # attention
-            "conv1", "conv2", "conv_in", "conv_out", # resnet + input/output convolutions
+            "to_q", "to_v", "to_k", "to_out.0",  # self/cross attention
             "proj_in", "proj_out",                  # transformer projections
         ],
         lora_dropout=0.0,
@@ -127,52 +144,62 @@ def train_inpainting_model(cfg: RI3DConfig, shared_components=None):
     unet = get_peft_model(unet, lora_config)
     unet.print_trainable_parameters()
 
-    optimizer = torch.optim.AdamW(unet.parameters(), lr=cfg.inpainting_lr, weight_decay=1e-2)
+    optimizer = torch.optim.AdamW(unet.parameters(), lr=cfg.inpainting_lr,
+                                  weight_decay=1e-2, fused=True)
 
     n_iters = cfg.inpainting_train_iters
-    print(f"Training inpainting LoRA for {n_iters} iterations on {len(scene_images)} images...")
+    max_t = noise_scheduler.config.num_train_timesteps
+    inference_max_t = int(max_t * cfg.inpainting_strength)  # img2img range
+    scale = vae.config.scaling_factor
+
+    print(f"Training inpainting LoRA for {n_iters} iterations on {n_images} images...")
     losses = []
 
     for step in tqdm(range(n_iters), desc=f"Inpainting [{cfg.scene_name}]"):
-        img_pil = random.choice(scene_images)
-        w, h = img_pil.size
+        img_t = img_tensors_gpu[random.randint(0, n_images - 1)]
+        _, h, w = img_t.shape
 
-        # Random 512x512 crop
+        # Random 512x512 crop on GPU (avoids PIL/numpy per step)
         x0 = random.randint(0, max(0, w - 512))
         y0 = random.randint(0, max(0, h - 512))
-        crop = img_pil.crop((x0, y0, x0 + 512, y0 + 512))
-        img_np = np.array(crop).astype(np.float32) / 255.0
+        crop = img_t[:, y0:y0+512, x0:x0+512].unsqueeze(0)
 
-        mask_np = generate_random_mask(512, 512)
+        # Random mask on GPU
+        mask = torch.zeros(1, 1, 512, 512, device=device, dtype=dtype)
+        for _r in range(random.randint(1, 4)):
+            rh = int(512 * random.uniform(0.1, 0.8))
+            rw = int(512 * random.uniform(0.1, 0.8))
+            ry = random.randint(0, 512 - rh)
+            rx = random.randint(0, 512 - rw)
+            mask[:, :, ry:ry+rh, rx:rx+rw] = 1.0
 
-        img_tensor = torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0).to(device, dtype)
-        mask_tensor = torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0).to(device, dtype)
-        masked_img = img_tensor * (1 - mask_tensor)
+        masked_img = crop * (1 - mask)
 
+        # Combined VAE encode: clean + masked in one call (2 encodes → 1 kernel)
         with torch.no_grad():
-            clean_latent = vae.encode(img_tensor * 2 - 1).latent_dist.sample() * vae.config.scaling_factor
-            masked_latent = vae.encode(masked_img * 2 - 1).latent_dist.sample() * vae.config.scaling_factor
+            both_lat = vae.encode(torch.cat([crop, masked_img]) * 2 - 1).latent_dist.sample() * scale
+            clean_latent, masked_latent = both_lat[:1], both_lat[1:]
 
-        mask_latent = F.interpolate(mask_tensor, size=clean_latent.shape[-2:], mode="nearest")
-
+        mask_latent = F.interpolate(mask, size=clean_latent.shape[-2:], mode="nearest")
         noise = torch.randn_like(clean_latent)
-        t = torch.randint(0, noise_scheduler.config.num_train_timesteps, (1,),
-                          device=device).long()
+        # Bias toward img2img inference range [0, strength*T] (same as step5)
+        t_range = inference_max_t if random.random() < 0.8 else max_t
+        t = torch.randint(0, t_range, (1,), device=device).long()
         noisy_latent = noise_scheduler.add_noise(clean_latent, noise, t)
 
         unet_input = torch.cat([noisy_latent, mask_latent, masked_latent], dim=1)
+        unet_input = unet_input.to(memory_format=torch.channels_last)
         noise_pred = unet(unet_input, t, encoder_hidden_states=text_embeds).sample
 
         loss = F.mse_loss(noise_pred.float(), noise.float())
         loss.backward()
         optimizer.step()
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
 
         losses.append(loss.item())
         if (step + 1) % 100 == 0:
             avg_loss = sum(losses[-100:]) / 100
             print(f"  Step {step+1}: loss = {avg_loss:.6f}")
-
 
     unet.save_pretrained(model_dir)
     print(f"Saved inpainting model to {model_dir}")
@@ -185,7 +212,7 @@ def train_inpainting_model(cfg: RI3DConfig, shared_components=None):
     fig.savefig(model_dir / "training_loss.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
 
-    del unet, optimizer
+    del unet, optimizer, img_tensors_gpu
     if _owns_components:
         del text_encoder, vae
     torch.cuda.empty_cache()
@@ -228,20 +255,25 @@ def test_inpainting_model(cfg: RI3DConfig):
         axes = axes.reshape(-1, 1)
 
     for j in range(n_test):
-        img = Image.open(image_paths[j]).convert("RGB").resize((512, 512), Image.LANCZOS)
-        mask_np = generate_random_mask(512, 512, min_ratio=0.15, max_ratio=0.4)
+        from step5_repair_model import _prepare_for_pipeline
+        img_orig = Image.open(image_paths[j]).convert("RGB")
+        img_resized, pipe_h, pipe_w = _prepare_for_pipeline(img_orig)
+        mask_np = generate_random_mask(pipe_h, pipe_w, min_ratio=0.15, max_ratio=0.4)
         mask_pil = Image.fromarray((mask_np * 255).astype(np.uint8), mode="L")
 
         with torch.no_grad():
             result = pipe(
                 prompt="",
-                image=img,
+                image=img_resized,
                 mask_image=mask_pil,
+                height=pipe_h,
+                width=pipe_w,
+                strength=cfg.inpainting_strength,
                 num_inference_steps=cfg.lcm_inference_steps,
                 guidance_scale=cfg.lcm_guidance_scale,
             ).images[0]
 
-        img_np = np.array(img)
+        img_np = np.array(img_resized)
         masked_np = img_np.copy()
         masked_np[mask_np > 0.5] = [128, 128, 128]
 

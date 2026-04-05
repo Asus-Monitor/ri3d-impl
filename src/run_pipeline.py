@@ -158,17 +158,22 @@ def run_prep_all_scenes(cfg: RI3DConfig):
         print("Step 4: all scenes already done.")
 
 
-def run_train_models(cfg: RI3DConfig):
-    """Train per-scene repair + inpainting models for all scenes.
+def run_train_models(cfg: RI3DConfig, single_scene: bool = False):
+    """Train per-scene repair + inpainting models.
 
     Loads frozen SD components once and shares them across scenes to avoid
     redundant model loading. Each scene gets its own personalized LoRA weights.
+
+    If single_scene=True, only trains for cfg's scene (from --scene flag).
     """
     import torch
     from step5_repair_model import run_step5
     from step7_inpainting_model import run_step7
 
-    scene_cfgs = _build_scene_cfgs(cfg)
+    if single_scene:
+        scene_cfgs = [cfg]
+    else:
+        scene_cfgs = _build_scene_cfgs(cfg)
     # Only train for scenes that have completed prep (steps 1-4)
     ready = [sc for sc in scene_cfgs
              if (sc.scene_output_dir() / "init_gaussians.pt").exists()]
@@ -360,9 +365,9 @@ def main():
         run_prep_all_scenes(cfg)
         return
 
-    # Train mode: steps 5+7 on all scenes
+    # Train mode: steps 5+7
     if args.train_models:
-        run_train_models(cfg)
+        run_train_models(cfg, single_scene=args.scene is not None)
         return
 
     # Optimize mode: steps 6+8 for one scene
