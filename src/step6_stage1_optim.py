@@ -81,7 +81,8 @@ def repair_image(pipe, image_tensor: torch.Tensor, cfg: RI3DConfig) -> torch.Ten
 
     with torch.no_grad():
         result = pipe(
-            prompt="",
+            prompt=cfg.repair_positive_prompt,
+            negative_prompt=cfg.repair_negative_prompt,
             image=img_resized,
             control_image=img_resized,
             strength=cfg.repair_strength,
@@ -209,9 +210,13 @@ def run_stage1(cfg: RI3DConfig):
                     r = model.render(novel_w2c[j], K_avg, H, W, return_depth=True)
                     repaired = repair_image(repair_pipe, r["image"], cfg)
                     pseudo_gt[j] = repaired.detach()
-                    # Cache background mask (expensive clustering — only at refresh)
+                    # Background mask from monocular depth of REPAIRED image (paper Sec 4.3):
+                    # "We obtain this background mask by applying agglomerative clustering
+                    #  on the monocular depth estimated for repaired images."
+                    from step8_stage2_optim import estimate_mono_depth
+                    mono_d = estimate_mono_depth(repaired, cfg)
                     cached_bg_masks[j] = get_background_mask(
-                        r["depth"].squeeze(-1), cfg
+                        mono_d, cfg
                     ).to(device)
 
                     # Save example renders (reuse already-rendered data, no extra render)

@@ -12,7 +12,10 @@
       "WebSearch",
       "WebFetch(domain:arxiv.org)",
       "Bash(python3:*)",
-      "Bash(git show:*)"
+      "Bash(git show:*)",
+      "Bash(gh api:*)",
+      "WebFetch(domain:stable-diffusion-art.com)",
+      "WebFetch(domain:astraml.com)"
     ]
   }
 }

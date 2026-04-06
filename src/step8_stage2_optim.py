@@ -362,16 +362,11 @@ def run_stage2(cfg: RI3DConfig):
                 for j in range(cfg.stage2_num_novel_views):
                     r = model.render(novel_w2c[j], K_avg, H, W, return_depth=True)
                     alpha_mask = get_opacity_mask(r["alpha"])
-                    bg_mask = compute_background_mask(
-                        r["depth"].squeeze(-1).detach(), cfg.bg_mask_n_clusters
-                    )
-                    cached_bg_masks[j] = bg_mask.to(device)
                     renders_cache[j] = {
                         "image": r["image"].detach(),
                         "depth": r["depth"].detach(),
                         "alpha": r["alpha"].detach(),
                         "alpha_mask": alpha_mask,
-                        "bg_mask": bg_mask,
                     }
 
                 # Phase 2: Clear ALL inpainted images from previous cycle.
@@ -382,9 +377,20 @@ def run_stage2(cfg: RI3DConfig):
                     inpainted_images[j] = None
 
                 # Phase 3: Inpaint selected views (before cutoff)
+                # Use rendered-depth bg_mask for identifying missing regions (fast)
+                render_bg_masks = {}
+                for j in range(cfg.stage2_num_novel_views):
+                    rc = renders_cache[j]
+                    render_bg_masks[j] = compute_background_mask(
+                        rc["depth"].squeeze(-1).detach(), cfg.bg_mask_n_clusters
+                    ).to(device)
+
                 do_inpaint = step < cfg.stage2_inpaint_cutoff
                 if do_inpaint:
                     # Per paper Sec 8.3: alternate even/odd view indices
+                    # select_inpaint_views needs bg_mask in renders_cache
+                    for j in render_bg_masks:
+                        renders_cache[j]["bg_mask"] = render_bg_masks[j]
                     inpaint_views = select_inpaint_views(
                         renders_cache, cfg.stage2_num_novel_views,
                         cfg.stage2_num_inpaint_views, inpaint_cycle,
@@ -402,12 +408,12 @@ def run_stage2(cfg: RI3DConfig):
                             rc = renders_cache[j]
                             inpainted = inpaint_missing_regions(
                                 inpaint_pipe, rc["image"], rc["alpha_mask"],
-                                rc["bg_mask"], cfg,
+                                render_bg_masks[j], cfg,
                             )
                             inpainted_images[j] = inpainted.detach()
 
                             # Project into 3D (subsampled, fast linear alignment)
-                            missing_mask = ((1 - rc["alpha_mask"]) * rc["bg_mask"]).detach()
+                            missing_mask = ((1 - rc["alpha_mask"]) * render_bg_masks[j]).detach()
                             new_gs = project_inpainted_to_3d(
                                 inpainted, missing_mask,
                                 rc["depth"], novel_c2w[j], K_avg, cfg,
@@ -448,6 +454,14 @@ def run_stage2(cfg: RI3DConfig):
                     else:
                         repaired = repair_image(repair_pipe, rc["image"], cfg)
                     pseudo_gt[j] = repaired.detach()
+
+                    # Background mask from mono depth of REPAIRED image (paper Sec 4.3):
+                    # "We obtain this background mask by applying agglomerative
+                    #  clustering on the monocular depth estimated for repaired images."
+                    mono_d = estimate_mono_depth(repaired, cfg)
+                    cached_bg_masks[j] = compute_background_mask(
+                        mono_d, cfg.bg_mask_n_clusters
+                    ).to(device)
 
                 torch.cuda.empty_cache()
 
@@ -505,18 +519,25 @@ def run_stage2(cfg: RI3DConfig):
             )
             total_loss = total_loss + lambda_j * nov_loss
 
-            # Inpainting consistency loss: (1-M_α) ⊙ M_b ⊙ Lp (per paper)
-            # Use CURRENT alpha mask, not stale cached one — as optimization
-            # fills regions, the mask should shrink automatically
+            # Inpainting consistency loss: (1-M_α) ⊙ M_b ⊙ Lp (per paper Eq. 4)
+            # Uses LPIPS (perceptual loss) per paper notation "Lp".
+            # Current alpha mask — as optimization fills regions, mask shrinks.
             if inpainted_images[nov_idx] is not None and cached_bg_masks[nov_idx] is not None:
                 alpha_mask_now = get_opacity_mask(result_nov["alpha"])
                 mask_ip = (1 - alpha_mask_now) * cached_bg_masks[nov_idx]
-                n_masked = mask_ip.sum().clamp(min=1)
-                mask_3ch = mask_ip.unsqueeze(-1)
-                inpaint_loss = (
-                    (result_nov["image"] - inpainted_images[nov_idx]).abs() * mask_3ch
-                ).sum() / (n_masked * 3)
-                total_loss = total_loss + 0.5 * inpaint_loss
+                if mask_ip.sum() > 100:
+                    inpaint_loss = lpips_fn(
+                        result_nov["image"], inpainted_images[nov_idx],
+                        return_map=True,
+                    )  # (H, W) spatial loss
+                    # Resize if LPIPS map differs from mask resolution
+                    if inpaint_loss.shape != mask_ip.shape:
+                        inpaint_loss = F.interpolate(
+                            inpaint_loss.unsqueeze(0).unsqueeze(0),
+                            size=mask_ip.shape, mode="bilinear", align_corners=False,
+                        ).squeeze()
+                    inpaint_loss = (inpaint_loss * mask_ip).sum() / mask_ip.sum().clamp(min=1)
+                    total_loss = total_loss + cfg.loss_lpips_weight * inpaint_loss
 
         total_loss.backward()
         model.step_post_backward(step, result_ref["meta"])

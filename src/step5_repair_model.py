@@ -79,12 +79,12 @@ def generate_leave_one_out_data(cfg: RI3DConfig):
 
     torch.backends.cudnn.benchmark = True
 
-    # Pre-compute snapshot steps:
-    #  - Phase 1 (before re-add): a few early snapshots to capture severe corruption
-    #    that the repair model will encounter during early Stage 1 optimization
-    #  - Phase 2 (after re-add): progressively refined snapshots per paper Sec 4.2
-    phase1_snapshots = {cfg.loo_initial_iters // 2, cfg.loo_initial_iters - 1}
-    snapshot_steps = phase1_snapshots | set(
+    # Snapshot only during phase 2 (after re-adding the left-out view), per paper Sec 4.2.
+    # Phase 1 renders are maximally corrupted (model never saw this view) — including
+    # them poisons LoRA training with impossible extreme-corruption→clean mappings.
+    # Phase 2 gives progressive corruption: moderate→mild, matching what the repair
+    # model actually encounters during Stage 1 (heavy corruption is masked out by M_α).
+    snapshot_steps = set(
         range(cfg.loo_initial_iters, cfg.loo_total_iters, cfg.loo_snapshot_interval)
     )
 
@@ -259,15 +259,33 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
         text_encoder.requires_grad_(False)
         vae.requires_grad_(False)
         unet.requires_grad_(False)
-        with torch.no_grad():
-            tokens = tokenizer("", padding="max_length", max_length=77,
-                               return_tensors="pt").input_ids.to(device)
-            text_embeds = text_encoder(tokens)[0]
     else:
+        tokenizer = None
+        text_encoder = None
         vae = shared_components["vae"]
         unet = shared_components["unet"]
-        text_embeds = shared_components["text_embeds"]
         noise_scheduler = shared_components["noise_scheduler"]
+
+    # Encode the SAME positive prompt used at inference (cfg.repair_positive_prompt).
+    # Training with empty "" but inferring with "best quality, sharp detail" creates
+    # a text-embedding mismatch that distorts the LoRA's learned corrections.
+    if tokenizer is None or text_encoder is None:
+        tokenizer = CLIPTokenizer.from_pretrained(cfg.sd_model, subfolder="tokenizer")
+        text_encoder = CLIPTextModel.from_pretrained(cfg.sd_model, subfolder="text_encoder",
+                                                      torch_dtype=dtype).to(device)
+        text_encoder.requires_grad_(False)
+        _owns_text_encoder = True
+    else:
+        _owns_text_encoder = False
+
+    with torch.no_grad():
+        tokens = tokenizer(cfg.repair_positive_prompt, padding="max_length", max_length=77,
+                           truncation=True, return_tensors="pt").input_ids.to(device)
+        text_embeds = text_encoder(tokens)[0]
+
+    if _owns_text_encoder and not _owns_components:
+        del text_encoder
+        torch.cuda.empty_cache()
 
     # ------------------------------------------------------------------
     # Pre-compute: resize pairs, move to GPU, pre-encode clean latents.
@@ -327,7 +345,6 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
 
     n_iters = cfg.repair_train_iters
     max_t = noise_scheduler.config.num_train_timesteps
-    inference_max_t = int(max_t * cfg.repair_strength)
 
     # Scale batch size to GPU memory
     gpu_mem_gb = torch.cuda.get_device_properties(device).total_memory / (1024 ** 3)
@@ -370,11 +387,7 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
             clean_lat = cl_full[:, ly:ly+latent_crop, lx:lx+latent_crop].unsqueeze(0)
 
             noise = torch.randn_like(clean_lat)
-            # Bias timestep sampling toward the img2img inference range
-            if random.random() < 0.8:
-                t = torch.randint(0, inference_max_t, (1,), device=device).long()
-            else:
-                t = torch.randint(0, max_t, (1,), device=device).long()
+            t = torch.randint(0, max_t, (1,), device=device).long()
 
             # Standard training per paper: noise clean latent, predict epsilon.
             # ControlNet condition (corrupted image) teaches the mapping.
@@ -501,7 +514,8 @@ def test_repair_model(cfg: RI3DConfig):
 
         with torch.no_grad():
             result = pipe(
-                prompt="",
+                prompt=cfg.repair_positive_prompt,
+                negative_prompt=cfg.repair_negative_prompt,
                 image=corrupted_resized,
                 control_image=corrupted_resized,
                 strength=cfg.repair_strength,

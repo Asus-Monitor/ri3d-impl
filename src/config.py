@@ -44,19 +44,21 @@ class RI3DConfig:
     # Repair model (ControlNet + UNet LoRA, DPM++ scheduler)
     sd_model: str = "stable-diffusion-v1-5/stable-diffusion-v1-5"
     controlnet_model: str = "lllyasviel/control_v11f1e_sd15_tile"
-    repair_train_iters: int = 200 # paper Sec 8.1: "fine-tune for 1800 iterations"
+    repair_train_iters: int = 2000 # paper Sec 8.1: "fine-tune for 1800 iterations"
     repair_lr: float = 1e-4
-    repair_lora_rank: int = 96
-    repair_inference_steps: int = 15   # DPM++ 2M Karras (no LCM for ControlNet)
-    repair_guidance_scale: float = 1.0  # low CFG — repair should preserve structure, not hallucinate
+    repair_lora_rank: int = 64
+    repair_inference_steps: int = 20   # DPM++ 2M Karras
+    repair_guidance_scale: float = 4.0  # moderate CFG — needed to make negative prompt effective
     repair_controlnet_scale: float = 1.0  # ControlNet conditioning strength
-    repair_strength: float = 0.675        # img2img denoising strength (0=no change, 1=full regeneration)
+    repair_strength: float = 0.63        # img2img — LoRA needs init latent as anchor (unlike full fine-tune)
+    repair_positive_prompt: str = "best quality, sharp detail"
+    repair_negative_prompt: str = "blur, lowres, artifacts, distortion, worst quality"
 
     # LCM (used for inpainting only — incompatible with ControlNet)
     lcm_lora: str = "latent-consistency/lcm-lora-sdv1-5"
     lcm_inference_steps: int = 8
     lcm_guidance_scale: float = 1.0   # no CFG amplification — empty prompt means no text direction
-    inpainting_strength: float = 0.85  # img2img strength — high since masked areas need full generation
+    inpainting_strength: float = 0.65  # img2img strength — high since masked areas need full generation
 
     # Leave-one-out training for repair
     loo_initial_iters: int = 6000  # iters before re-adding left-out view

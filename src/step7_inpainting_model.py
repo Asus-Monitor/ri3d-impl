@@ -112,26 +112,36 @@ def train_inpainting_model(cfg: RI3DConfig, shared_components=None):
         noise_scheduler = shared_components["noise_scheduler"]
 
     # ------------------------------------------------------------------
-    # Cache image tensors on GPU to avoid PIL/numpy/CPU→GPU work per step.
-    # VAE encoding still happens per step on the actual crop (not pre-encoded)
-    # to avoid receptive-field artifacts from latent-space cropping.
+    # Pre-compute: cache images on GPU, pre-encode clean latents through VAE.
+    # Crops are 8px-aligned so clean_latent can be cropped in latent space
+    # (eliminates 1 of 2 VAE encodes per step). Masked image still needs
+    # per-step VAE encode since the mask changes each step.
     # ------------------------------------------------------------------
     torch.backends.cudnn.benchmark = True
     vae.eval()
-    img_tensors_gpu = []  # (3, H, W) on GPU
+    latent_crop = 64  # 512px // 8
+    scale = vae.config.scaling_factor
 
-    for img_pil in scene_images:
-        w, h = img_pil.size
-        img_np = np.array(img_pil).astype(np.float32) / 255.0
-        img_t = torch.from_numpy(img_np).permute(2, 0, 1).to(device, dtype)
-        img_tensors_gpu.append(img_t)
+    img_tensors_gpu = []    # (3, H, W) on GPU, dims rounded to 8
+    clean_latents_gpu = []  # (4, H//8, W//8) pre-encoded
+
+    with torch.no_grad():
+        for img_pil in scene_images:
+            w, h = img_pil.size
+            h8, w8 = (h // 8) * 8, (w // 8) * 8
+            if (h8, w8) != (h, w):
+                img_pil = img_pil.crop((0, 0, w8, h8))
+            img_np = np.array(img_pil).astype(np.float32) / 255.0
+            img_t = torch.from_numpy(img_np).permute(2, 0, 1).to(device, dtype)
+            img_tensors_gpu.append(img_t)
+            lat = vae.encode(img_t.unsqueeze(0) * 2 - 1).latent_dist.sample() * scale
+            clean_latents_gpu.append(lat.squeeze(0))
 
     n_images = len(img_tensors_gpu)
 
     # Fresh UNet + LoRA for this scene
     unet = UNet2DConditionModel.from_pretrained(inpaint_model_id, subfolder="unet",
                                                  torch_dtype=dtype).to(device)
-    unet = unet.to(memory_format=torch.channels_last)
     lora_config = LoraConfig(
         r=cfg.inpainting_lora_rank,
         lora_alpha=cfg.inpainting_lora_rank,
@@ -144,62 +154,93 @@ def train_inpainting_model(cfg: RI3DConfig, shared_components=None):
     unet = get_peft_model(unet, lora_config)
     unet.print_trainable_parameters()
 
-    optimizer = torch.optim.AdamW(unet.parameters(), lr=cfg.inpainting_lr,
-                                  weight_decay=1e-2, fused=True)
+    optimizer = torch.optim.AdamW(unet.parameters(), lr=cfg.inpainting_lr, weight_decay=1e-2)
 
     n_iters = cfg.inpainting_train_iters
     max_t = noise_scheduler.config.num_train_timesteps
-    inference_max_t = int(max_t * cfg.inpainting_strength)  # img2img range
-    scale = vae.config.scaling_factor
 
-    print(f"Training inpainting LoRA for {n_iters} iterations on {n_images} images...")
+    # Auto-scale batch size to GPU memory
+    gpu_mem_gb = torch.cuda.get_device_properties(device).total_memory / (1024 ** 3)
+    if gpu_mem_gb >= 20:
+        batch_size = 4
+    elif gpu_mem_gb >= 12:
+        batch_size = 2
+    else:
+        batch_size = 1
+    n_steps = (n_iters + batch_size - 1) // batch_size
+    text_embeds_b = text_embeds.expand(batch_size, -1, -1)
+
+    print(f"Training inpainting LoRA for {n_iters} iterations (batch={batch_size}) "
+          f"on {n_images} images...")
     losses = []
+    iter_count = 0
 
-    for step in tqdm(range(n_iters), desc=f"Inpainting [{cfg.scene_name}]"):
-        img_t = img_tensors_gpu[random.randint(0, n_images - 1)]
-        _, h, w = img_t.shape
+    for step in tqdm(range(n_steps), desc=f"Inpainting [{cfg.scene_name}]"):
+        actual_bs = min(batch_size, n_iters - iter_count)
+        if actual_bs <= 0:
+            break
 
-        # Random 512x512 crop on GPU (avoids PIL/numpy per step)
-        x0 = random.randint(0, max(0, w - 512))
-        y0 = random.randint(0, max(0, h - 512))
-        crop = img_t[:, y0:y0+512, x0:x0+512].unsqueeze(0)
+        clean_lats = []
+        masked_imgs = []
+        mask_lats = []
+        noises = []
+        ts = []
 
-        # Random mask on GPU
-        mask = torch.zeros(1, 1, 512, 512, device=device, dtype=dtype)
-        for _r in range(random.randint(1, 4)):
-            rh = int(512 * random.uniform(0.1, 0.8))
-            rw = int(512 * random.uniform(0.1, 0.8))
-            ry = random.randint(0, 512 - rh)
-            rx = random.randint(0, 512 - rw)
-            mask[:, :, ry:ry+rh, rx:rx+rw] = 1.0
+        for _ in range(actual_bs):
+            idx = random.randint(0, n_images - 1)
+            img_t = img_tensors_gpu[idx]
+            full_lat = clean_latents_gpu[idx]
+            _, h, w = img_t.shape
 
-        masked_img = crop * (1 - mask)
+            # 8px-aligned crop for exact latent correspondence
+            x0 = random.randint(0, max(0, (w - 512) // 8)) * 8
+            y0 = random.randint(0, max(0, (h - 512) // 8)) * 8
+            lx, ly = x0 // 8, y0 // 8
+            crop = img_t[:, y0:y0+512, x0:x0+512].unsqueeze(0)
 
-        # Combined VAE encode: clean + masked in one call (2 encodes → 1 kernel)
+            # Clean latent from pre-encoded — no VAE encode needed
+            clean_lat = full_lat[:, ly:ly+latent_crop, lx:lx+latent_crop].unsqueeze(0)
+
+            # Random mask on GPU
+            mask = torch.zeros(1, 1, 512, 512, device=device, dtype=dtype)
+            for _r in range(random.randint(1, 4)):
+                rh = int(512 * random.uniform(0.1, 0.8))
+                rw = int(512 * random.uniform(0.1, 0.8))
+                ry = random.randint(0, 512 - rh)
+                rx = random.randint(0, 512 - rw)
+                mask[:, :, ry:ry+rh, rx:rx+rw] = 1.0
+
+            masked_imgs.append(crop * (1 - mask))
+            mask_lats.append(F.interpolate(mask, size=(latent_crop, latent_crop), mode="nearest"))
+            clean_lats.append(clean_lat)
+            noises.append(torch.randn_like(clean_lat))
+            ts.append(torch.randint(0, max_t, (1,), device=device).long())
+
+        clean_lat_b = torch.cat(clean_lats)
+        masked_img_b = torch.cat(masked_imgs)
+        mask_lat_b = torch.cat(mask_lats)
+        noise_b = torch.cat(noises)
+        t_b = torch.cat(ts)
+
+        # Only VAE encode needed: masked images (mask changes each step)
         with torch.no_grad():
-            both_lat = vae.encode(torch.cat([crop, masked_img]) * 2 - 1).latent_dist.sample() * scale
-            clean_latent, masked_latent = both_lat[:1], both_lat[1:]
+            masked_lat_b = vae.encode(masked_img_b * 2 - 1).latent_dist.sample() * scale
 
-        mask_latent = F.interpolate(mask, size=clean_latent.shape[-2:], mode="nearest")
-        noise = torch.randn_like(clean_latent)
-        # Bias toward img2img inference range [0, strength*T] (same as step5)
-        t_range = inference_max_t if random.random() < 0.8 else max_t
-        t = torch.randint(0, t_range, (1,), device=device).long()
-        noisy_latent = noise_scheduler.add_noise(clean_latent, noise, t)
+        noisy_lat_b = noise_scheduler.add_noise(clean_lat_b, noise_b, t_b)
+        unet_input = torch.cat([noisy_lat_b, mask_lat_b, masked_lat_b], dim=1)
+        noise_pred = unet(unet_input, t_b, encoder_hidden_states=text_embeds_b[:actual_bs]).sample
 
-        unet_input = torch.cat([noisy_latent, mask_latent, masked_latent], dim=1)
-        unet_input = unet_input.to(memory_format=torch.channels_last)
-        noise_pred = unet(unet_input, t, encoder_hidden_states=text_embeds).sample
-
-        loss = F.mse_loss(noise_pred.float(), noise.float())
+        loss = F.mse_loss(noise_pred.float(), noise_b.float())
         loss.backward()
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
+        iter_count += actual_bs
         losses.append(loss.item())
-        if (step + 1) % 100 == 0:
-            avg_loss = sum(losses[-100:]) / 100
-            print(f"  Step {step+1}: loss = {avg_loss:.6f}")
+        if iter_count % 100 < batch_size or step == n_steps - 1:
+            recent = losses[-max(1, 100 // batch_size):]
+            avg_loss = sum(recent) / len(recent)
+            print(f"  Step ~{min(iter_count, n_iters)}: loss = {avg_loss:.6f}")
 
     unet.save_pretrained(model_dir)
     print(f"Saved inpainting model to {model_dir}")
@@ -212,7 +253,7 @@ def train_inpainting_model(cfg: RI3DConfig, shared_components=None):
     fig.savefig(model_dir / "training_loss.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
 
-    del unet, optimizer, img_tensors_gpu
+    del unet, optimizer, img_tensors_gpu, clean_latents_gpu
     if _owns_components:
         del text_encoder, vae
     torch.cuda.empty_cache()
