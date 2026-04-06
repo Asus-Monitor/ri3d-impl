@@ -282,13 +282,50 @@ class LPIPSLoss:
         return spatial.mean()
 
 
+def ensure_depth_convention(mono_depth: torch.Tensor, rendered_depth: torch.Tensor | None = None) -> torch.Tensor:
+    """Convert mono depth to same convention as rendered depth (larger = farther).
+
+    Depth Anything V2 outputs inverse depth (disparity: closer = larger values).
+    Rendered depth from gsplat is always proper depth (closer = smaller values).
+    This function detects the convention mismatch and inverts if needed.
+
+    Args:
+        mono_depth: (H, W) raw monocular depth
+        rendered_depth: optional (H, W) rendered depth for correlation check.
+            If None, assumes mono is inverse depth and inverts unconditionally.
+    Returns:
+        depth in proper convention (larger = farther)
+    """
+    md = mono_depth.squeeze()
+
+    if rendered_depth is not None:
+        rd = rendered_depth.squeeze()
+        # Check correlation between the two — if negative, mono is inverse
+        rd_flat = rd.reshape(-1).float()
+        md_flat = md.reshape(-1).float()
+        # Use only valid pixels
+        valid = (rd_flat > 0.01) & (md_flat.abs() > 1e-8)
+        if valid.sum() > 100:
+            r = rd_flat[valid] - rd_flat[valid].mean()
+            m = md_flat[valid] - md_flat[valid].mean()
+            corr = (r * m).sum() / (r.norm() * m.norm() + 1e-8)
+            if corr < -0.1:
+                # Negative correlation → mono is inverse depth, invert it
+                return 1.0 / (md + 1e-6)
+        return md
+
+    # No reference depth — Depth Anything V2 is known to output inverse depth,
+    # so invert unconditionally
+    return 1.0 / (md + 1e-6)
+
+
 def depth_correlation_loss(rendered_depth: torch.Tensor, mono_depth: torch.Tensor,
                             mask: torch.Tensor | None = None) -> torch.Tensor:
     """Pearson correlation loss between rendered and monocular depth.
 
     Args:
-        rendered_depth: (H, W) or (H, W, 1)
-        mono_depth: (H, W)
+        rendered_depth: (H, W) or (H, W, 1) — proper depth (larger = farther)
+        mono_depth: (H, W) — must be in same convention (use ensure_depth_convention first)
         mask: optional (H, W) boolean mask
     """
     rd = rendered_depth.squeeze()

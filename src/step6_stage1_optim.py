@@ -29,6 +29,7 @@ from config import RI3DConfig
 from gaussian_trainer import (
     GaussianModel, SSIMLoss, LPIPSLoss, depth_correlation_loss,
     reconstruction_loss, PlateauDetector, compute_background_mask,
+    ensure_depth_convention,
 )
 from step4_gaussian_init import generate_elliptical_cameras
 
@@ -147,11 +148,15 @@ def run_stage1(cfg: RI3DConfig):
         img = Image.open(ip).convert("RGB").resize((W, H), Image.LANCZOS)
         gt_images.append(torch.from_numpy(np.array(img)).float().to(device) / 255.0)
 
-    # Load mono depth for depth correlation loss
+    # Load mono depth for depth correlation loss.
+    # Depth Anything V2 outputs inverse depth (closer = larger). Convert to
+    # proper depth (closer = smaller) using DUSt3R depth as reference.
     mono_depths = []
     for i in range(n_images):
         md = torch.load(out_dir / "mono_depths" / f"mono_depth_{i:03d}.pt", weights_only=True)
-        mono_depths.append(md.float().to(device))
+        dust3r_d = torch.load(out_dir / "dust3r_depths" / f"depth_{i:03d}.pt", weights_only=True)
+        md = ensure_depth_convention(md.float(), dust3r_d.float())
+        mono_depths.append(md.to(device))
 
     # Initialize model
     model = GaussianModel(gaussians_init, device)

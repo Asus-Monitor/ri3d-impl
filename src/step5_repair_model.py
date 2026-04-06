@@ -184,38 +184,6 @@ def generate_all_scenes_data(cfg: RI3DConfig):
         generate_leave_one_out_data(scene_cfg)
 
 
-def _resize_and_crop_pair(corrupted: torch.Tensor, clean: torch.Tensor,
-                           size: int = 512) -> tuple[torch.Tensor, torch.Tensor]:
-    """Resize so smallest dim = size, then random crop to size x size.
-
-    Per paper: "we resize the input images during fine-tuning so that their smallest
-    dimension is 512 pixels, followed by random 512x512 cropping."
-
-    Both tensors must be (H, W, 3). Returns (3, size, size) tensors.
-    """
-    H, W = corrupted.shape[:2]
-    # Resize keeping aspect ratio so smallest dim = size
-    if H < W:
-        new_h, new_w = size, int(W * size / H)
-    else:
-        new_w, new_h = size, int(H * size / W)
-
-    corrupted_r = F.interpolate(
-        corrupted.permute(2, 0, 1).unsqueeze(0), size=(new_h, new_w),
-        mode="bilinear", align_corners=False
-    ).squeeze(0)
-    clean_r = F.interpolate(
-        clean.permute(2, 0, 1).unsqueeze(0), size=(new_h, new_w),
-        mode="bilinear", align_corners=False
-    ).squeeze(0)
-
-    # Random crop (same location for both)
-    y = random.randint(0, max(0, new_h - size))
-    x = random.randint(0, max(0, new_w - size))
-    return (corrupted_r[:, y:y+size, x:x+size],
-            clean_r[:, y:y+size, x:x+size])
-
-
 def train_repair_model(cfg: RI3DConfig, shared_components=None):
     """Train a per-scene repair model (ControlNet LoRA) on this scene's leave-one-out data.
 

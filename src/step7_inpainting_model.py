@@ -24,22 +24,6 @@ import matplotlib.pyplot as plt
 from config import RI3DConfig
 
 
-def generate_random_mask(H: int, W: int, min_ratio: float = 0.1,
-                          max_ratio: float = 0.6) -> np.ndarray:
-    """Generate a random rectangular mask for training.
-    Returns binary mask where 1 = masked (to inpaint), 0 = visible.
-    """
-    mask = np.zeros((H, W), dtype=np.float32)
-    n_rects = random.randint(1, 4)
-    for _ in range(n_rects):
-        h = int(H * random.uniform(0.1, 0.8))
-        w = int(W * random.uniform(0.1, 0.8))
-        y = random.randint(0, H - h)
-        x = random.randint(0, W - w)
-        mask[y:y+h, x:x+w] = 1.0
-    return mask
-
-
 def collect_scene_images(cfg: RI3DConfig) -> list[Image.Image]:
     """Collect this scene's input images, resized for diffusion training.
 

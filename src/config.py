@@ -67,7 +67,7 @@ class RI3DConfig:
     loo_render_scale: float = 0.5     # train LOO 3DGS at lower res for speed (snapshots use full res)
 
     # Inpainting model
-    inpainting_train_iters: int = 50
+    inpainting_train_iters: int = 2000  # paper Sec 8.2: "fine-tune the model for 2000 iterations"
     inpainting_lr: float = 1e-4
     inpainting_lora_rank: int = 64
 

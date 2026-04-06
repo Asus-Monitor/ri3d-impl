@@ -31,6 +31,7 @@ from config import RI3DConfig
 from gaussian_trainer import (
     GaussianModel, SSIMLoss, LPIPSLoss, depth_correlation_loss,
     reconstruction_loss, PlateauDetector, compute_background_mask,
+    ensure_depth_convention,
 )
 from step4_gaussian_init import generate_elliptical_cameras, unproject_depth
 from step6_stage1_optim import (
@@ -116,10 +117,13 @@ def inpaint_missing_regions(pipe, rendered_image: torch.Tensor,
 def estimate_mono_depth(image_tensor: torch.Tensor, cfg: RI3DConfig) -> torch.Tensor:
     """Run monocular depth estimation on an image tensor.
 
+    Returns proper depth (larger = farther). Depth Anything V2 outputs inverse
+    depth (disparity), so we invert it here to match the rendered depth convention.
+
     Args:
         image_tensor: (H, W, 3) float tensor in [0, 1]
     Returns:
-        depth: (H, W) float tensor
+        depth: (H, W) float tensor, proper depth (larger = farther)
     """
     from transformers import pipeline as hf_pipeline
 
@@ -143,6 +147,12 @@ def estimate_mono_depth(image_tensor: torch.Tensor, cfg: RI3DConfig) -> torch.Te
         mono.unsqueeze(0).unsqueeze(0).float(),
         size=(H, W), mode="bilinear", align_corners=False,
     ).squeeze()
+
+    # Depth Anything V2 outputs inverse depth (closer = larger).
+    # Convert to proper depth (closer = smaller) so that background mask
+    # clustering correctly identifies far objects as background.
+    mono = 1.0 / (mono + 1e-6)
+
     return mono.to(image_tensor.device)
 
 
@@ -297,11 +307,14 @@ def run_stage2(cfg: RI3DConfig):
         img = Image.open(ip).convert("RGB").resize((W, H), Image.LANCZOS)
         gt_images.append(torch.from_numpy(np.array(img)).float().to(device) / 255.0)
 
-    # Load mono depths for reference
+    # Load mono depths for reference.
+    # Convert from inverse depth (Depth Anything V2) to proper depth using DUSt3R as reference.
     mono_depths = []
     for i in range(n_images):
         md = torch.load(out_dir / "mono_depths" / f"mono_depth_{i:03d}.pt", weights_only=True)
-        mono_depths.append(md.float().to(device))
+        dust3r_d = torch.load(out_dir / "dust3r_depths" / f"depth_{i:03d}.pt", weights_only=True)
+        md = ensure_depth_convention(md.float(), dust3r_d.float())
+        mono_depths.append(md.to(device))
 
     # Initialize model from Stage 1
     model = GaussianModel(stage1_ckpt["gaussians"], device)
@@ -525,22 +538,18 @@ def run_stage2(cfg: RI3DConfig):
                     ssim_fn, lpips_fn_or_none, cfg,
                 )
 
-                # Term 3: (1-M_α) ⊙ M_b ⊙ Lp — only for inpainted views
+                # Term 3: (1-M_α) ⊙ M_b ⊙ Lp(rendered, inpainted) — per paper Eq. 4.
+                # Uses L1 (pixel-level) loss for tight anchoring of inpainted content.
+                # NOT divided by M — paper applies this per-view without normalization.
                 if inpainted_images[nov_idx] is not None and cached_bg_masks[nov_idx] is not None:
                     alpha_mask_now = get_opacity_mask(result_nov["alpha"])
                     mask_ip = (1 - alpha_mask_now) * cached_bg_masks[nov_idx]
                     if mask_ip.sum() > 100:
-                        inpaint_loss = lpips_fn(
-                            result_nov["image"], inpainted_images[nov_idx],
-                            return_map=True,
-                        )  # (H, W) spatial loss
-                        if inpaint_loss.shape != mask_ip.shape:
-                            inpaint_loss = F.interpolate(
-                                inpaint_loss.unsqueeze(0).unsqueeze(0),
-                                size=mask_ip.shape, mode="bilinear", align_corners=False,
-                            ).squeeze()
-                        inpaint_loss = (inpaint_loss * mask_ip).sum() / mask_ip.sum().clamp(min=1)
-                        view_loss = view_loss + (cfg.loss_lpips_weight / M) * inpaint_loss
+                        mask_ip_3ch = mask_ip.unsqueeze(-1)  # (H, W, 1)
+                        n_ip_pixels = mask_ip.sum().clamp(min=1)
+                        # L1 loss in inpainted regions
+                        ip_l1 = ((result_nov["image"] - inpainted_images[nov_idx]).abs() * mask_ip_3ch).sum() / (n_ip_pixels * 3)
+                        view_loss = view_loss + cfg.loss_l1_weight * ip_l1
 
                 view_loss.backward()
                 loss_val += view_loss.item()
