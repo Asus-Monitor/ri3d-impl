@@ -31,7 +31,6 @@ from gaussian_trainer import (
     reconstruction_loss, PlateauDetector, compute_background_mask,
 )
 from step4_gaussian_init import generate_elliptical_cameras
-from step8_stage2_optim import estimate_mono_depth
 
 
 def load_repair_pipeline(cfg: RI3DConfig):
@@ -214,6 +213,7 @@ def run_stage1(cfg: RI3DConfig):
                     # Background mask from monocular depth of REPAIRED image (paper Sec 4.3):
                     # "We obtain this background mask by applying agglomerative clustering
                     #  on the monocular depth estimated for repaired images."
+                    from step8_stage2_optim import estimate_mono_depth
                     mono_d = estimate_mono_depth(repaired, cfg)
                     cached_bg_masks[j] = get_background_mask(
                         mono_d, cfg
