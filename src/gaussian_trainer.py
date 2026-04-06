@@ -201,6 +201,62 @@ class GaussianModel:
             self.params, self._optimizers, self._strategy_state, step, meta, packed=True
         )
 
+    def extend_with_gaussians(self, new_gaussians: dict, cfg: 'RI3DConfig'):
+        """Add new Gaussians while preserving optimizer state for existing ones.
+
+        Unlike recreating optimizers from scratch, this:
+          1. Saves Adam momentum (exp_avg) and variance (exp_avg_sq) for old Gaussians
+          2. Extends parameters by concatenating old + new
+          3. Creates new optimizers pointing to the new Parameters
+          4. Restores saved Adam state, padded with zeros for new elements
+          5. Extends strategy state tensors (grad2d, count) with zeros
+        """
+        device = self.device
+        n_new = new_gaussians["means"].shape[0]
+
+        # --- Save optimizer state for each parameter ---
+        saved_states = {}
+        for key, opt in self._optimizers.items():
+            param = self.params[key]
+            if param in opt.state:
+                s = opt.state[param]
+                saved_states[key] = {
+                    'step': s['step'].clone(),
+                    'exp_avg': s['exp_avg'].clone(),
+                    'exp_avg_sq': s['exp_avg_sq'].clone(),
+                }
+
+        # --- Extend parameters ---
+        for key in self.params:
+            old_data = self.params[key].data
+            new_data = new_gaussians[key].float().to(device)
+            self.params[key] = nn.Parameter(torch.cat([old_data, new_data], dim=0))
+
+        # --- Create new optimizers (pointing to new Parameters) ---
+        self.setup_optimizers(cfg)
+
+        # --- Restore saved state, padded with zeros for new elements ---
+        for key, opt in self._optimizers.items():
+            param = self.params[key]
+            if key in saved_states:
+                ss = saved_states[key]
+                pad_shape = [n_new] + list(ss['exp_avg'].shape[1:])
+                opt.state[param] = {
+                    'step': ss['step'],
+                    'exp_avg': torch.cat([ss['exp_avg'],
+                                          torch.zeros(pad_shape, device=device)], dim=0),
+                    'exp_avg_sq': torch.cat([ss['exp_avg_sq'],
+                                             torch.zeros(pad_shape, device=device)], dim=0),
+                }
+
+        # --- Extend strategy state tensors ---
+        if hasattr(self, '_strategy_state') and self._strategy_state is not None:
+            for state_key in ('grad2d', 'count', 'radii'):
+                t = self._strategy_state.get(state_key)
+                if t is not None:
+                    pad = torch.zeros(n_new, device=t.device, dtype=t.dtype)
+                    self._strategy_state[state_key] = torch.cat([t, pad], dim=0)
+
     def optimizer_step(self):
         for opt in self._optimizers.values():
             opt.step()

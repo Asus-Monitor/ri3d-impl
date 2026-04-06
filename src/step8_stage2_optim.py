@@ -247,17 +247,6 @@ def project_inpainted_to_3d(inpainted_image: torch.Tensor, missing_mask: torch.T
     }
 
 
-def add_gaussians_to_model(model: GaussianModel, new_gaussians: dict):
-    """Append new Gaussians to existing model."""
-    device = model.device
-    for key in model.params:
-        old = model.params[key].data
-        new = new_gaussians[key].float().to(device)
-        combined = torch.cat([old, new], dim=0)
-        model.params[key] = torch.nn.Parameter(combined)
-    return model
-
-
 def select_inpaint_views(renders_cache: dict, n_views: int, k_inpaint: int,
                           cycle: int) -> list[int]:
     """Select K views for inpainting using alternating even/odd pattern.
@@ -416,7 +405,6 @@ def run_stage2(cfg: RI3DConfig):
                             print("  Loading inpainting pipeline...")
                             inpaint_pipe = load_inpainting_pipeline(cfg)
 
-                        any_added = False
                         for j in inpaint_views:
                             rc = renders_cache[j]
                             inpainted = inpaint_missing_regions(
@@ -433,17 +421,12 @@ def run_stage2(cfg: RI3DConfig):
                             )
                             if new_gs is not None:
                                 n_before = model.n_gaussians
-                                add_gaussians_to_model(model, new_gs)
-                                any_added = True
+                                # Extend model preserving optimizer momentum + strategy state
+                                model.extend_with_gaussians(new_gs, cfg)
+                                optimizers = model._optimizers
+                                strategy_state = model._strategy_state
                                 print(f"    View {j}: +{model.n_gaussians - n_before} "
                                       f"Gaussians (total: {model.n_gaussians})")
-
-                        # Re-setup optimizers/strategy once after all additions
-                        if any_added:
-                            optimizers = model.setup_optimizers(cfg)
-                            strategy, strategy_state = model.setup_strategy(
-                                cfg, scene_scale=scene_scale,
-                            )
                 else:
                     # Past cutoff — permanently free inpaint + depth models
                     if inpaint_pipe is not None:
