@@ -340,7 +340,7 @@ def main():
         dataset_dir = scene_dir.parent
 
     cfg = RI3DConfig(
-        scene_dir=scene_dir or dataset_dir,
+        scene_dir=scene_dir,
         dataset_dir=dataset_dir,
         output_dir=output_dir,
         n_views=args.n_views,
