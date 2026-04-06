@@ -487,8 +487,6 @@ def run_stage2(cfg: RI3DConfig):
 
             del renders_cache
 
-        total_loss = torch.tensor(0.0, device=device)
-
         # --- Input view loss ---
         ref_idx = step % n_images
         w2c_ref = input_w2c[ref_idx]
@@ -503,10 +501,15 @@ def run_stage2(cfg: RI3DConfig):
                                         ssim_fn, lpips_fn_or_none, cfg)
         d_corr = depth_correlation_loss(result_ref["depth"], mono_depths[ref_idx])
         ref_loss = ref_loss + cfg.loss_depth_corr_weight * d_corr
-        total_loss = total_loss + ref_loss
+
+        # Backward input view (frees its render graph; gradients accumulate)
+        ref_loss.backward()
+        model.step_post_backward(step, result_ref["meta"])
+        loss_val = ref_loss.item()
 
         # --- Novel view losses (no visibility mask in Stage 2) ---
         # Per paper Eq. 4: sum over ALL M novel views (term 2) and K inpainted views (term 3).
+        # Backward per view to avoid OOM from holding all M render graphs.
         if pseudo_gt[0] is not None:
             for nov_idx in range(cfg.stage2_num_novel_views):
                 w2c_nov = novel_w2c[nov_idx]
@@ -515,11 +518,10 @@ def run_stage2(cfg: RI3DConfig):
                 lambda_j = camera_weights[nov_idx]
 
                 # Term 2: λ_j * L_rec — NO visibility mask (key difference from Stage 1)
-                nov_loss = reconstruction_loss(
+                view_loss = lambda_j * reconstruction_loss(
                     result_nov["image"], pseudo_gt[nov_idx],
                     ssim_fn, lpips_fn_or_none, cfg,
                 )
-                total_loss = total_loss + lambda_j * nov_loss
 
                 # Term 3: (1-M_α) ⊙ M_b ⊙ Lp — only for inpainted views
                 if inpainted_images[nov_idx] is not None and cached_bg_masks[nov_idx] is not None:
@@ -536,13 +538,13 @@ def run_stage2(cfg: RI3DConfig):
                                 size=mask_ip.shape, mode="bilinear", align_corners=False,
                             ).squeeze()
                         inpaint_loss = (inpaint_loss * mask_ip).sum() / mask_ip.sum().clamp(min=1)
-                        total_loss = total_loss + cfg.loss_lpips_weight * inpaint_loss
+                        view_loss = view_loss + cfg.loss_lpips_weight * inpaint_loss
 
-        total_loss.backward()
-        model.step_post_backward(step, result_ref["meta"])
+                view_loss.backward()
+                loss_val += view_loss.item()
+
+        # All gradients accumulated — step optimizers
         model.optimizer_step()
-
-        loss_val = total_loss.item()
         losses_history.append(loss_val)
 
         if (step + 1) % 200 == 0:

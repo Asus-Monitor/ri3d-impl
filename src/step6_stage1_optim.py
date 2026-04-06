@@ -233,8 +233,6 @@ def run_stage1(cfg: RI3DConfig):
                                     dpi=120, bbox_inches="tight")
                         plt.close(fig)
 
-        total_loss = torch.tensor(0.0, device=device)
-
         # --- Input view loss (with densification hooks) ---
         ref_idx = step % n_images
         w2c_ref = input_w2c[ref_idx]
@@ -252,12 +250,14 @@ def run_stage1(cfg: RI3DConfig):
         d_corr = depth_correlation_loss(result_ref["depth"], mono_depths[ref_idx])
         ref_loss = ref_loss + cfg.loss_depth_corr_weight * d_corr
 
-        total_loss = total_loss + ref_loss
+        # Backward input view (frees its render graph; gradients accumulate)
+        ref_loss.backward()
+        model.step_post_backward(step, result_ref["meta"])
+        loss_val = ref_loss.item()
 
         # --- Novel view losses (WITHOUT densification hooks) ---
         # Per paper Eq. 3: sum over ALL M novel views each step.
-        # Uses render_for_loss (no strategy hooks) so pseudo GT gradients
-        # do NOT drive Gaussian splitting/cloning/pruning.
+        # Backward per view to avoid OOM from holding all M render graphs.
         if pseudo_gt[0] is not None:
             for nov_idx in range(cfg.stage1_num_novel_views):
                 w2c_nov = novel_w2c[nov_idx]
@@ -274,7 +274,7 @@ def run_stage1(cfg: RI3DConfig):
                     ssim_fn, lpips_fn_or_none, cfg,
                     mask=alpha_mask,
                 )
-                total_loss = total_loss + lambda_j * nov_loss
+                view_loss = lambda_j * nov_loss
 
                 # Term 3: ||A ⊙ (1 - M_α) ⊙ M_b||₁
                 bg_mask = cached_bg_masks[nov_idx]
@@ -282,13 +282,13 @@ def run_stage1(cfg: RI3DConfig):
                     opacity_reg = (
                         result_nov["alpha"].squeeze(-1) * (1 - alpha_mask) * bg_mask
                     ).abs().mean()
-                    total_loss = total_loss + cfg.loss_opacity_reg_weight * opacity_reg
+                    view_loss = view_loss + cfg.loss_opacity_reg_weight * opacity_reg
 
-        total_loss.backward()
-        model.step_post_backward(step, result_ref["meta"])
+                view_loss.backward()
+                loss_val += view_loss.item()
+
+        # All gradients accumulated — step optimizers
         model.optimizer_step()
-
-        loss_val = total_loss.item()
         losses_history.append(loss_val)
 
         if (step + 1) % 200 == 0:
