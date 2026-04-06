@@ -360,9 +360,12 @@ def main():
         run_single_step(args.step, cfg)
         return
 
-    # Prep mode: steps 1-4 for all scenes
+    # Prep mode: steps 1-4
     if args.prep:
-        run_prep_all_scenes(cfg)
+        if args.scene is not None:
+            run_prep_scene(cfg)
+        else:
+            run_prep_all_scenes(cfg)
         return
 
     # Train mode: steps 5+7
