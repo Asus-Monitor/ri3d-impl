@@ -99,7 +99,12 @@ def generate_leave_one_out_data(cfg: RI3DConfig):
 
         model = GaussianModel(gaussians_init, device)
         optimizers = model.setup_optimizers(cfg)
-        strategy, strategy_state = model.setup_strategy(cfg, scene_scale=1.0)
+        # Compute scene scale from camera positions (same as Stage 1/2)
+        cam_positions = poses[:, :3, 3]
+        loo_scene_scale = max(
+            (cam_positions - cam_positions.mean(dim=0)).norm(dim=1).mean().item(), 0.1
+        )
+        strategy, strategy_state = model.setup_strategy(cfg, scene_scale=loo_scene_scale)
 
         w2c_lo = w2c_all[left_out_idx]
         K_lo = K_all[left_out_idx]

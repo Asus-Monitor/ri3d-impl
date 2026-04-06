@@ -15,7 +15,10 @@
       "Bash(git show:*)",
       "Bash(gh api:*)",
       "WebFetch(domain:stable-diffusion-art.com)",
-      "WebFetch(domain:astraml.com)"
+      "WebFetch(domain:astraml.com)",
+      "Bash(ls -la /home/vy/ri3d-impl/output/bonsai/stage1_renders/final_novel_00*.png)",
+      "Bash(ls /home/vy/ri3d-impl/output/bonsai/stage1_renders/step*.png)",
+      "Bash(ls:*)"
     ]
   }
 }

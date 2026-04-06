@@ -134,7 +134,8 @@ class GaussianModel:
         return result
 
     def render_for_loss(self, w2c: torch.Tensor, K: torch.Tensor, H: int, W: int,
-                         bg_color: torch.Tensor | None = None) -> dict:
+                         bg_color: torch.Tensor | None = None,
+                         render_mode: str = "RGB+D") -> dict:
         """Render with gradients but WITHOUT densification hooks (novel views).
 
         Gradients flow through for loss computation, but do NOT influence
@@ -157,15 +158,17 @@ class GaussianModel:
             sh_degree=None,
             packed=True,
             near_plane=0.01, far_plane=1000.0,
-            render_mode="RGB+D",
+            render_mode=render_mode,
             backgrounds=backgrounds,
         )
 
-        return {
+        result = {
             "image": render_colors[0, :, :, :3],
             "alpha": render_alphas[0],
-            "depth": render_colors[0, :, :, 3:4],
         }
+        if render_mode == "RGB+D":
+            result["depth"] = render_colors[0, :, :, 3:4]
+        return result
 
     def setup_optimizers(self, cfg: RI3DConfig) -> dict:
         """Create per-parameter optimizers."""

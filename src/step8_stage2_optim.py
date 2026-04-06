@@ -514,11 +514,13 @@ def run_stage2(cfg: RI3DConfig):
             for nov_idx in range(cfg.stage2_num_novel_views):
                 w2c_nov = novel_w2c[nov_idx]
 
-                result_nov = model.render_for_loss(w2c_nov, K_avg, H, W)
+                result_nov = model.render_for_loss(w2c_nov, K_avg, H, W, render_mode="RGB")
                 lambda_j = camera_weights[nov_idx]
 
                 # Term 2: λ_j * L_rec — NO visibility mask (key difference from Stage 1)
-                view_loss = lambda_j * reconstruction_loss(
+                # Normalize by M so total novel contribution ≈ single-view magnitude.
+                M = cfg.stage2_num_novel_views
+                view_loss = (lambda_j / M) * reconstruction_loss(
                     result_nov["image"], pseudo_gt[nov_idx],
                     ssim_fn, lpips_fn_or_none, cfg,
                 )
@@ -538,7 +540,7 @@ def run_stage2(cfg: RI3DConfig):
                                 size=mask_ip.shape, mode="bilinear", align_corners=False,
                             ).squeeze()
                         inpaint_loss = (inpaint_loss * mask_ip).sum() / mask_ip.sum().clamp(min=1)
-                        view_loss = view_loss + cfg.loss_lpips_weight * inpaint_loss
+                        view_loss = view_loss + (cfg.loss_lpips_weight / M) * inpaint_loss
 
                 view_loss.backward()
                 loss_val += view_loss.item()

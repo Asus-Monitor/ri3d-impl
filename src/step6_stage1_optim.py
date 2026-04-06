@@ -262,19 +262,21 @@ def run_stage1(cfg: RI3DConfig):
             for nov_idx in range(cfg.stage1_num_novel_views):
                 w2c_nov = novel_w2c[nov_idx]
 
-                result_nov = model.render_for_loss(w2c_nov, K_avg, H, W)
+                result_nov = model.render_for_loss(w2c_nov, K_avg, H, W, render_mode="RGB")
 
                 # Opacity mask: only enforce loss in visible regions (M_α)
                 alpha_mask = get_opacity_mask(result_nov["alpha"])  # (H, W)
                 lambda_j = camera_weights[nov_idx]
 
                 # Term 2: λ_j * M_α * L_rec (LPIPS only every 10th step for speed)
+                # Normalize by M so total novel contribution ≈ single-view magnitude.
+                # Without this, M=8 novel views overwhelm the 1 input view per step.
                 nov_loss = reconstruction_loss(
                     result_nov["image"], pseudo_gt[nov_idx],
                     ssim_fn, lpips_fn_or_none, cfg,
                     mask=alpha_mask,
                 )
-                view_loss = lambda_j * nov_loss
+                view_loss = (lambda_j / cfg.stage1_num_novel_views) * nov_loss
 
                 # Term 3: ||A ⊙ (1 - M_α) ⊙ M_b||₁
                 bg_mask = cached_bg_masks[nov_idx]
@@ -282,7 +284,7 @@ def run_stage1(cfg: RI3DConfig):
                     opacity_reg = (
                         result_nov["alpha"].squeeze(-1) * (1 - alpha_mask) * bg_mask
                     ).abs().mean()
-                    view_loss = view_loss + cfg.loss_opacity_reg_weight * opacity_reg
+                    view_loss = view_loss + (cfg.loss_opacity_reg_weight / cfg.stage1_num_novel_views) * opacity_reg
 
                 view_loss.backward()
                 loss_val += view_loss.item()

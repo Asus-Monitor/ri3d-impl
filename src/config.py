@@ -96,9 +96,9 @@ class RI3DConfig:
     loss_opacity_reg_weight: float = 0.01
 
     # Plateau detection (replaces fixed iteration counts)
-    plateau_window: int = 200      # look-back window in iterations
-    plateau_threshold: float = 1e-4  # min relative improvement to continue
-    plateau_min_iters: int = 1000   # minimum iters before allowing early stop
+    plateau_window: int = 400      # match refresh interval so window spans a full cycle
+    plateau_threshold: float = 5e-4  # min relative improvement to continue
+    plateau_min_iters: int = 2000   # run at least half the max iters before allowing early stop
 
     # 3DGS densification (scaled for 4000-iter optimization)
     densify_start: int = 500
