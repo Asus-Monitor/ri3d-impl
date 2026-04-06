@@ -31,6 +31,7 @@ from gaussian_trainer import (
     reconstruction_loss, PlateauDetector, compute_background_mask,
 )
 from step4_gaussian_init import generate_elliptical_cameras
+from step8_stage2_optim import estimate_mono_depth
 
 
 def load_repair_pipeline(cfg: RI3DConfig):
@@ -209,11 +210,10 @@ def run_stage1(cfg: RI3DConfig):
                 for j in range(cfg.stage1_num_novel_views):
                     r = model.render(novel_w2c[j], K_avg, H, W, return_depth=True)
                     repaired = repair_image(repair_pipe, r["image"], cfg)
-                    pseudo_gt[j] = repaired.detach()
+                    pseudo_gt[j] = repaired.clamp(0, 1).detach()
                     # Background mask from monocular depth of REPAIRED image (paper Sec 4.3):
                     # "We obtain this background mask by applying agglomerative clustering
                     #  on the monocular depth estimated for repaired images."
-                    from step8_stage2_optim import estimate_mono_depth
                     mono_d = estimate_mono_depth(repaired, cfg)
                     cached_bg_masks[j] = get_background_mask(
                         mono_d, cfg
@@ -254,34 +254,35 @@ def run_stage1(cfg: RI3DConfig):
 
         total_loss = total_loss + ref_loss
 
-        # --- Novel view loss (WITHOUT densification hooks) ---
-        # Per paper Eq. 4.3: λ_j * M_α_j * L_rec(rendered_j, repaired_j)
+        # --- Novel view losses (WITHOUT densification hooks) ---
+        # Per paper Eq. 3: sum over ALL M novel views each step.
         # Uses render_for_loss (no strategy hooks) so pseudo GT gradients
         # do NOT drive Gaussian splitting/cloning/pruning.
         if pseudo_gt[0] is not None:
-            nov_idx = step % cfg.stage1_num_novel_views
-            w2c_nov = novel_w2c[nov_idx]
+            for nov_idx in range(cfg.stage1_num_novel_views):
+                w2c_nov = novel_w2c[nov_idx]
 
-            result_nov = model.render_for_loss(w2c_nov, K_avg, H, W)
+                result_nov = model.render_for_loss(w2c_nov, K_avg, H, W)
 
-            # Opacity mask: only enforce loss in visible regions (M_α)
-            alpha_mask = get_opacity_mask(result_nov["alpha"])  # (H, W)
-            lambda_j = camera_weights[nov_idx]
+                # Opacity mask: only enforce loss in visible regions (M_α)
+                alpha_mask = get_opacity_mask(result_nov["alpha"])  # (H, W)
+                lambda_j = camera_weights[nov_idx]
 
-            nov_loss = reconstruction_loss(
-                result_nov["image"], pseudo_gt[nov_idx],
-                ssim_fn, lpips_fn_or_none, cfg,
-                mask=alpha_mask,
-            )
-            total_loss = total_loss + lambda_j * nov_loss
+                # Term 2: λ_j * M_α * L_rec (LPIPS only every 10th step for speed)
+                nov_loss = reconstruction_loss(
+                    result_nov["image"], pseudo_gt[nov_idx],
+                    ssim_fn, lpips_fn_or_none, cfg,
+                    mask=alpha_mask,
+                )
+                total_loss = total_loss + lambda_j * nov_loss
 
-            # Opacity regularization: ||A ⊙ (1 - M_α) ⊙ M_b||₁
-            bg_mask = cached_bg_masks[nov_idx]
-            if bg_mask is not None:
-                opacity_reg = (
-                    result_nov["alpha"].squeeze(-1) * (1 - alpha_mask) * bg_mask
-                ).abs().mean()
-                total_loss = total_loss + cfg.loss_opacity_reg_weight * opacity_reg
+                # Term 3: ||A ⊙ (1 - M_α) ⊙ M_b||₁
+                bg_mask = cached_bg_masks[nov_idx]
+                if bg_mask is not None:
+                    opacity_reg = (
+                        result_nov["alpha"].squeeze(-1) * (1 - alpha_mask) * bg_mask
+                    ).abs().mean()
+                    total_loss = total_loss + cfg.loss_opacity_reg_weight * opacity_reg
 
         total_loss.backward()
         model.step_post_backward(step, result_ref["meta"])

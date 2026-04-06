@@ -410,7 +410,7 @@ def run_stage2(cfg: RI3DConfig):
                                 inpaint_pipe, rc["image"], rc["alpha_mask"],
                                 render_bg_masks[j], cfg,
                             )
-                            inpainted_images[j] = inpainted.detach()
+                            inpainted_images[j] = inpainted.clamp(0, 1).detach()
 
                             # Project into 3D (subsampled, fast linear alignment)
                             missing_mask = ((1 - rc["alpha_mask"]) * render_bg_masks[j]).detach()
@@ -453,7 +453,7 @@ def run_stage2(cfg: RI3DConfig):
                         repaired = repair_image(repair_pipe, inpainted_images[j], cfg)
                     else:
                         repaired = repair_image(repair_pipe, rc["image"], cfg)
-                    pseudo_gt[j] = repaired.detach()
+                    pseudo_gt[j] = repaired.clamp(0, 1).detach()
 
                     # Background mask from mono depth of REPAIRED image (paper Sec 4.3):
                     # "We obtain this background mask by applying agglomerative
@@ -505,39 +505,38 @@ def run_stage2(cfg: RI3DConfig):
         ref_loss = ref_loss + cfg.loss_depth_corr_weight * d_corr
         total_loss = total_loss + ref_loss
 
-        # --- Novel view loss (no visibility mask in Stage 2) ---
+        # --- Novel view losses (no visibility mask in Stage 2) ---
+        # Per paper Eq. 4: sum over ALL M novel views (term 2) and K inpainted views (term 3).
         if pseudo_gt[0] is not None:
-            nov_idx = step % cfg.stage2_num_novel_views
-            w2c_nov = novel_w2c[nov_idx]
+            for nov_idx in range(cfg.stage2_num_novel_views):
+                w2c_nov = novel_w2c[nov_idx]
 
-            result_nov = model.render_for_loss(w2c_nov, K_avg, H, W)
-            lambda_j = camera_weights[nov_idx]
+                result_nov = model.render_for_loss(w2c_nov, K_avg, H, W)
+                lambda_j = camera_weights[nov_idx]
 
-            nov_loss = reconstruction_loss(
-                result_nov["image"], pseudo_gt[nov_idx],
-                ssim_fn, lpips_fn_or_none, cfg,
-            )
-            total_loss = total_loss + lambda_j * nov_loss
+                # Term 2: λ_j * L_rec — NO visibility mask (key difference from Stage 1)
+                nov_loss = reconstruction_loss(
+                    result_nov["image"], pseudo_gt[nov_idx],
+                    ssim_fn, lpips_fn_or_none, cfg,
+                )
+                total_loss = total_loss + lambda_j * nov_loss
 
-            # Inpainting consistency loss: (1-M_α) ⊙ M_b ⊙ Lp (per paper Eq. 4)
-            # Uses LPIPS (perceptual loss) per paper notation "Lp".
-            # Current alpha mask — as optimization fills regions, mask shrinks.
-            if inpainted_images[nov_idx] is not None and cached_bg_masks[nov_idx] is not None:
-                alpha_mask_now = get_opacity_mask(result_nov["alpha"])
-                mask_ip = (1 - alpha_mask_now) * cached_bg_masks[nov_idx]
-                if mask_ip.sum() > 100:
-                    inpaint_loss = lpips_fn(
-                        result_nov["image"], inpainted_images[nov_idx],
-                        return_map=True,
-                    )  # (H, W) spatial loss
-                    # Resize if LPIPS map differs from mask resolution
-                    if inpaint_loss.shape != mask_ip.shape:
-                        inpaint_loss = F.interpolate(
-                            inpaint_loss.unsqueeze(0).unsqueeze(0),
-                            size=mask_ip.shape, mode="bilinear", align_corners=False,
-                        ).squeeze()
-                    inpaint_loss = (inpaint_loss * mask_ip).sum() / mask_ip.sum().clamp(min=1)
-                    total_loss = total_loss + cfg.loss_lpips_weight * inpaint_loss
+                # Term 3: (1-M_α) ⊙ M_b ⊙ Lp — only for inpainted views
+                if inpainted_images[nov_idx] is not None and cached_bg_masks[nov_idx] is not None:
+                    alpha_mask_now = get_opacity_mask(result_nov["alpha"])
+                    mask_ip = (1 - alpha_mask_now) * cached_bg_masks[nov_idx]
+                    if mask_ip.sum() > 100:
+                        inpaint_loss = lpips_fn(
+                            result_nov["image"], inpainted_images[nov_idx],
+                            return_map=True,
+                        )  # (H, W) spatial loss
+                        if inpaint_loss.shape != mask_ip.shape:
+                            inpaint_loss = F.interpolate(
+                                inpaint_loss.unsqueeze(0).unsqueeze(0),
+                                size=mask_ip.shape, mode="bilinear", align_corners=False,
+                            ).squeeze()
+                        inpaint_loss = (inpaint_loss * mask_ip).sum() / mask_ip.sum().clamp(min=1)
+                        total_loss = total_loss + cfg.loss_lpips_weight * inpaint_loss
 
         total_loss.backward()
         model.step_post_backward(step, result_ref["meta"])
