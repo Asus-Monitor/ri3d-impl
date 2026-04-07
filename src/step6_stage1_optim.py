@@ -70,15 +70,15 @@ def load_repair_pipeline(cfg: RI3DConfig):
     return pipe
 
 
-def repair_image(pipe, image_tensor: torch.Tensor, cfg: RI3DConfig) -> torch.Tensor:
+def repair_image(pipe, image_tensor: torch.Tensor, cfg: RI3DConfig,
+                 view_index: int = 0) -> torch.Tensor:
     """Run repair model on a rendered image.
-
-    Uses img2img + ControlNet with high strength (0.8). The LoRA-adapted conditioning
-    embedding handles corrupted inputs correctly (no hallucination). The 20% preserved
-    signal from img2img provides color and layout consistency that pure txt2img lacks.
 
     Args:
         image_tensor: (H, W, 3) float tensor in [0, 1]
+        view_index: deterministic seed offset for this view. Same view_index
+            produces same noise → consistent pseudo GT across refresh cycles,
+            preventing the optimization from getting conflicting gradients.
 
     Returns:
         repaired: (H, W, 3) float tensor in [0, 1]
@@ -87,24 +87,29 @@ def repair_image(pipe, image_tensor: torch.Tensor, cfg: RI3DConfig) -> torch.Ten
 
     H, W = image_tensor.shape[:2]
 
-    # Convert to PIL, preserving aspect ratio (matches training preprocessing)
     img_np = (image_tensor.clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
     img_pil = Image.fromarray(img_np)
     img_resized, pipe_h, pipe_w = _prepare_for_pipeline(img_pil)
+
+    # Fixed seed per view: same view always gets same noise trajectory.
+    # The output still changes across refresh cycles (because the rendered
+    # input changes), but the stochastic component is fixed — so changes
+    # in pseudo GT come only from actual Gaussian improvement, not noise.
+    generator = torch.Generator(device=cfg.device).manual_seed(42 + view_index)
 
     with torch.no_grad():
         result = pipe(
             prompt=cfg.repair_positive_prompt,
             negative_prompt=cfg.repair_negative_prompt,
-            image=img_resized,            # img2img starting point (preserves colors/layout)
-            control_image=img_resized,    # ControlNet condition (LoRA-adapted structure)
+            image=img_resized,
+            control_image=img_resized,
             strength=cfg.repair_strength,
             num_inference_steps=cfg.repair_inference_steps,
             guidance_scale=cfg.repair_guidance_scale,
             controlnet_conditioning_scale=cfg.repair_controlnet_scale,
+            generator=generator,
         ).images[0]
 
-    # Convert back to tensor at original resolution
     result_np = np.array(result.resize((W, H), Image.LANCZOS)).astype(np.float32) / 255.0
     return torch.from_numpy(result_np).to(image_tensor.device)
 
@@ -230,7 +235,7 @@ def run_stage1(cfg: RI3DConfig):
             with torch.no_grad():
                 for j in range(cfg.stage1_num_novel_views):
                     r = model.render(novel_w2c[j], K_avg, H, W, return_depth=True)
-                    repaired = repair_image(repair_pipe, r["image"], cfg)
+                    repaired = repair_image(repair_pipe, r["image"], cfg, view_index=j)
                     pseudo_gt[j] = repaired.clamp(0, 1).detach()
                     # Background mask from monocular depth of REPAIRED image (paper Sec 4.3):
                     # "We obtain this background mask by applying agglomerative clustering

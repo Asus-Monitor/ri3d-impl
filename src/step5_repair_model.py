@@ -325,7 +325,7 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
             "controlnet_cond_embedding.blocks.5",
             "controlnet_cond_embedding.conv_out",
         ],
-        lora_dropout=0.0,
+        lora_dropout=0.1,  # regularization: prevents overfitting to 24 LOO pairs
     )
     controlnet = get_peft_model(controlnet, lora_config)
     controlnet.print_trainable_parameters()
@@ -463,20 +463,13 @@ def _prepare_for_pipeline(image: Image.Image, target_short_side: int = 512) -> t
 
 
 def test_repair_model(cfg: RI3DConfig):
-    """Test the trained repair model on corrupted images from this scene."""
-    from diffusers import (
-        StableDiffusionControlNetImg2ImgPipeline,
-        ControlNetModel,
-        DPMSolverMultistepScheduler,
-    )
-    from peft import PeftModel
+    """Test the trained repair model using the same pipeline and inference
+    path as the actual optimization (load_repair_pipeline + repair_image)."""
+    from step6_stage1_optim import load_repair_pipeline, repair_image
 
     out_dir = cfg.scene_output_dir()
     test_dir = out_dir / "repair_test"
     test_dir.mkdir(parents=True, exist_ok=True)
-
-    device = cfg.device
-    dtype = cfg.dtype
 
     pairs_path = out_dir / "repair_training_data" / "training_pairs.pt"
     if not pairs_path.exists():
@@ -484,19 +477,8 @@ def test_repair_model(cfg: RI3DConfig):
         return
     pairs = torch.load(pairs_path, weights_only=False)
 
-    model_dir = cfg.scene_output_dir() / "repair_model"
     print("Loading repair pipeline for test...")
-    controlnet = ControlNetModel.from_pretrained(cfg.controlnet_model, torch_dtype=dtype, use_safetensors=False)
-    controlnet = PeftModel.from_pretrained(controlnet, model_dir / "controlnet")
-    controlnet = controlnet.merge_and_unload()
-
-    pipe = StableDiffusionControlNetImg2ImgPipeline.from_pretrained(
-        cfg.sd_model, controlnet=controlnet, torch_dtype=dtype,
-    ).to(device)
-
-    pipe.scheduler = DPMSolverMultistepScheduler.from_config(
-        pipe.scheduler.config, use_karras_sigmas=True)
-    pipe.safety_checker = None
+    pipe = load_repair_pipeline(cfg)
 
     n_test = min(4, len(pairs))
     fig, axes = plt.subplots(3, n_test, figsize=(5 * n_test, 15))
@@ -507,31 +489,17 @@ def test_repair_model(cfg: RI3DConfig):
         idx = j * (len(pairs) // n_test)
         corrupted, clean = pairs[idx]
 
-        corrupted_pil = Image.fromarray(
-            (corrupted.numpy() * 255).astype(np.uint8)
-        )
-        corrupted_resized, pipe_h, pipe_w = _prepare_for_pipeline(corrupted_pil)
+        # Use repair_image — same function called during optimization
+        corrupted_tensor = corrupted.to(cfg.device)
+        repaired_tensor = repair_image(pipe, corrupted_tensor, cfg, view_index=j)
 
-        with torch.no_grad():
-            result = pipe(
-                prompt=cfg.repair_positive_prompt,
-                negative_prompt=cfg.repair_negative_prompt,
-                image=corrupted_resized,
-                control_image=corrupted_resized,
-                strength=cfg.repair_strength,
-                num_inference_steps=cfg.repair_inference_steps,
-                guidance_scale=cfg.repair_guidance_scale,
-                controlnet_conditioning_scale=cfg.repair_controlnet_scale,
-            ).images[0]
-
-        # Resize result back to original pair resolution for comparison
         H_orig, W_orig = corrupted.shape[:2]
-        result = result.resize((W_orig, H_orig), Image.LANCZOS)
+        result_np = repaired_tensor.cpu().numpy()
 
         axes[0, j].imshow(corrupted.numpy())
-        axes[0, j].set_title("Corrupted")
+        axes[0, j].set_title(f"Corrupted (pair {idx})")
         axes[0, j].axis("off")
-        axes[1, j].imshow(result)
+        axes[1, j].imshow(result_np)
         axes[1, j].set_title("Repaired")
         axes[1, j].axis("off")
         axes[2, j].imshow(clean.numpy())

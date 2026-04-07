@@ -46,7 +46,7 @@ class RI3DConfig:
     controlnet_model: str = "lllyasviel/control_v11f1e_sd15_tile"
     repair_train_iters: int = 1800 # paper Sec 8.1: "fine-tune for 1800 iterations"
     repair_lr: float = 1e-4
-    repair_lora_rank: int = 64
+    repair_lora_rank: int = 96
     repair_inference_steps: int = 20   # DPM++ 2M Karras
     repair_guidance_scale: float = 4.0  # moderate CFG — needed to make negative prompt effective
     repair_controlnet_scale: float = 0.75  # <1.0 lets LoRA override artifacts ControlNet would preserve

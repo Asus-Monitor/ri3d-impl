@@ -446,9 +446,9 @@ def run_stage2(cfg: RI3DConfig):
                 for j in range(cfg.stage2_num_novel_views):
                     rc = renders_cache[j]
                     if inpainted_images[j] is not None:
-                        repaired = repair_image(repair_pipe, inpainted_images[j], cfg)
+                        repaired = repair_image(repair_pipe, inpainted_images[j], cfg, view_index=j)
                     else:
-                        repaired = repair_image(repair_pipe, rc["image"], cfg)
+                        repaired = repair_image(repair_pipe, rc["image"], cfg, view_index=j)
                     pseudo_gt[j] = repaired.clamp(0, 1).detach()
 
                     # Background mask from mono depth of REPAIRED image (paper Sec 4.3):
