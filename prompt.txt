@@ -9,3 +9,6 @@ hey please read paper.md and the codebase to understand what this is about. im h
 inpainting properly you can see for yourself in the inpainting test, for example the plant disappears or the rug becomes a different size. We need much     
 much consistency as possible, while inpainting properly. make sure that the lora train / inference parameters are set correctly as per industry standard    
 and that the target modules make sense! It is very important to me that you fix this, work the hardest you ever did to solve this issue    
+
+hey read paper.md and the codebase to understand what this is about. im having an issue with the step5 repair model, which is that its not     
+repairing heavily corrupted artifacts properly you can see for yourself in the repair test png, for example the blob colors get misinterpreted as something else instead of vanishing. We need much consistency as possible, while repairing properly. by that i mean the repaired regions should match the source image as close as possible without erroneous hallucination artifacts.   It is very important to me that you fix this, work the hardest you ever did to improve the repair model!    
