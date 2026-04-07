@@ -322,7 +322,7 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
             "controlnet_cond_embedding.blocks.5",
             "controlnet_cond_embedding.conv_out",
         ],
-        lora_dropout=0.1,  # regularization: prevents overfitting to 24 LOO pairs
+        lora_dropout=0.2,  # regularization: prevents overfitting to 24 LOO pairs
     )
     controlnet = get_peft_model(controlnet, lora_config)
     controlnet.print_trainable_parameters()
