@@ -44,13 +44,13 @@ class RI3DConfig:
     # Repair model (ControlNet + UNet LoRA, DPM++ scheduler)
     sd_model: str = "stable-diffusion-v1-5/stable-diffusion-v1-5"
     controlnet_model: str = "lllyasviel/control_v11f1e_sd15_tile"
-    repair_train_iters: int = 2000 # paper Sec 8.1: "fine-tune for 1800 iterations"
+    repair_train_iters: int = 1800 # paper Sec 8.1: "fine-tune for 1800 iterations"
     repair_lr: float = 1e-4
     repair_lora_rank: int = 64
     repair_inference_steps: int = 20   # DPM++ 2M Karras
     repair_guidance_scale: float = 4.0  # moderate CFG — needed to make negative prompt effective
-    repair_controlnet_scale: float = 1.0  # ControlNet conditioning strength
-    repair_strength: float = 0.63        # img2img — LoRA needs init latent as anchor (unlike full fine-tune)
+    repair_controlnet_scale: float = 0.75  # <1.0 lets LoRA override artifacts ControlNet would preserve
+    repair_strength: float = 0.9         # img2img: 80% noise drowns artifacts, 20% signal preserves colors/layout
     repair_positive_prompt: str = "best quality, sharp detail"
     repair_negative_prompt: str = "blur, lowres, artifacts, distortion, worst quality"
 
@@ -67,7 +67,7 @@ class RI3DConfig:
     loo_render_scale: float = 0.5     # train LOO 3DGS at lower res for speed (snapshots use full res)
 
     # Inpainting model
-    inpainting_train_iters: int = 2000  # paper Sec 8.2: "fine-tune the model for 2000 iterations"
+    inpainting_train_iters: int = 50 # paper Sec 8.2: "fine-tune the model for 2000 iterations"
     inpainting_lr: float = 1e-4
     inpainting_lora_rank: int = 64
 

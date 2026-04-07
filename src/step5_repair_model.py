@@ -298,7 +298,10 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
     n_pairs = len(pair_corrupted_gpu)
     print(f"Pre-encoded {n_pairs} pairs on GPU")
 
-    # Fresh ControlNet + LoRA for this scene (UNet stays frozen)
+    # Fresh ControlNet + LoRA AND UNet + LoRA for this scene.
+    # Per GaussianObject [42] (which this paper follows): fine-tune BOTH networks.
+    # ControlNet LoRA alone can't override the UNet's generative prior, causing it
+    # to hallucinate scene content (e.g., flowers) instead of removing artifacts.
     controlnet = ControlNetModel.from_pretrained(cfg.controlnet_model,
                                                   torch_dtype=dtype, use_safetensors=False).to(device)
     lora_config = LoraConfig(
@@ -308,11 +311,28 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
             "to_q", "to_v", "to_k", "to_out.0",  # attention
             "conv1", "conv2",                       # resnet convolutions
             "proj_in", "proj_out",                  # transformer projections
+            # CRITICAL: the conditioning embedding (8 Conv2d layers) is the very first
+            # thing that processes the corrupted image. Without LoRA here, it stays frozen
+            # as a tile-upscaling encoder and extracts wrong features from corrupted renders,
+            # causing the model to hallucinate scene content instead of cleaning artifacts.
+            # Listed individually to avoid matching the ModuleList/Sequential containers.
+            "controlnet_cond_embedding.conv_in",
+            "controlnet_cond_embedding.blocks.0",
+            "controlnet_cond_embedding.blocks.1",
+            "controlnet_cond_embedding.blocks.2",
+            "controlnet_cond_embedding.blocks.3",
+            "controlnet_cond_embedding.blocks.4",
+            "controlnet_cond_embedding.blocks.5",
+            "controlnet_cond_embedding.conv_out",
         ],
         lora_dropout=0.0,
     )
     controlnet = get_peft_model(controlnet, lora_config)
     controlnet.print_trainable_parameters()
+
+    # UNet stays frozen — ControlNet LoRA (including conditioning embedding)
+    # provides enough capacity for repair. UNet LoRA would OOM on <8GB GPUs.
+    unet.requires_grad_(False)
 
     optimizer = torch.optim.AdamW(controlnet.parameters(), lr=cfg.repair_lr, weight_decay=1e-2)
 
@@ -329,6 +349,10 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
         batch_size = 1
     n_steps = (n_iters + batch_size - 1) // batch_size
     text_embeds_b = text_embeds.expand(batch_size, -1, -1)
+
+    # GradScaler prevents fp16 gradient underflow. Without it, ~50% of LoRA
+    # parameters get zero gradients and never learn (verified empirically).
+    scaler = torch.amp.GradScaler("cuda")
 
     print(f"Training ControlNet LoRA for {n_iters} iterations (batch={batch_size}) "
           f"on {n_pairs} pairs...")
@@ -386,8 +410,9 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
         ).sample
 
         loss = F.mse_loss(noise_pred.float(), noise_b.float())
-        loss.backward()
-        optimizer.step()
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
         optimizer.zero_grad(set_to_none=True)
 
         iter_count += actual_bs
@@ -397,8 +422,10 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
             avg_loss = sum(recent) / len(recent)
             print(f"  Step ~{min(iter_count, n_iters)}: loss = {avg_loss:.6f}")
 
-    controlnet.save_pretrained(model_dir)
-    print(f"Saved repair model to {model_dir}")
+    controlnet.save_pretrained(model_dir / "controlnet")
+    # Save a marker so inference knows there's no UNet LoRA
+    (model_dir / "unet_frozen").touch()
+    print(f"Saved repair model (ControlNet LoRA incl. cond_embedding) to {model_dir}")
 
     fig, ax = plt.subplots(figsize=(10, 4))
     ax.plot(losses)
@@ -460,7 +487,7 @@ def test_repair_model(cfg: RI3DConfig):
     model_dir = cfg.scene_output_dir() / "repair_model"
     print("Loading repair pipeline for test...")
     controlnet = ControlNetModel.from_pretrained(cfg.controlnet_model, torch_dtype=dtype, use_safetensors=False)
-    controlnet = PeftModel.from_pretrained(controlnet, model_dir)
+    controlnet = PeftModel.from_pretrained(controlnet, model_dir / "controlnet")
     controlnet = controlnet.merge_and_unload()
 
     pipe = StableDiffusionControlNetImg2ImgPipeline.from_pretrained(

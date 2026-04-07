@@ -187,7 +187,7 @@ def run_train_models(cfg: RI3DConfig, single_scene: bool = False):
 
     # --- Step 5: Repair models (share frozen VAE + UNet across scenes) ---
     need_repair = [sc for sc in ready
-                   if not (sc.scene_output_dir() / "repair_model").exists()]
+                   if not (sc.scene_output_dir() / "repair_model" / "controlnet").exists()]
     if need_repair:
         print(f"\n--- Step 5: Repair Model — {len(need_repair)} scenes ---")
         from diffusers import AutoencoderKL, UNet2DConditionModel, DDPMScheduler
@@ -317,6 +317,7 @@ def main():
     parser.add_argument("--prep", action="store_true", help="Run steps 1-4 for all scenes")
     parser.add_argument("--train_models", action="store_true", help="Train shared models (steps 5+7)")
     parser.add_argument("--optimize", action="store_true", help="Run optimization (steps 6+8) for --scene")
+    parser.add_argument("--test_repair", action="store_true", help="Test repair model only (no training)")
 
     # Single step mode
     parser.add_argument("--step", type=int, default=None, help="Run a specific step (1-8)")
@@ -352,6 +353,14 @@ def main():
     print(f"  N views: {cfg.n_views}")
     print(f"  Output: {cfg.output_dir}")
     print(f"  Device: {cfg.device}, dtype: {cfg.dtype}")
+
+    # Test repair model only
+    if args.test_repair:
+        if args.scene is None:
+            parser.error("--scene is required for --test_repair")
+        from step5_repair_model import test_repair_model
+        test_repair_model(cfg)
+        return
 
     # Single step mode
     if args.step is not None:

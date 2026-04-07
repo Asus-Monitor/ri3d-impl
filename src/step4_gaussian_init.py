@@ -109,7 +109,9 @@ def compute_scene_center(poses: torch.Tensor, points: torch.Tensor = None) -> to
 
 
 def generate_elliptical_cameras(poses: torch.Tensor, n_cameras: int,
-                                 scene_center: torch.Tensor = None) -> torch.Tensor:
+                                 scene_center: torch.Tensor = None,
+                                 restrict_to_inputs: bool = False,
+                                 margin_deg: float = 20.0) -> torch.Tensor:
     """Generate novel cameras along an elliptical path aligned with input cameras.
 
     Per paper (Sec 4.3): "we introduce a set of M novel cameras along an elliptical
@@ -126,6 +128,11 @@ def generate_elliptical_cameras(poses: torch.Tensor, n_cameras: int,
         poses: (N, 4, 4) input camera-to-world matrices (OpenCV convention)
         n_cameras: number of novel cameras to generate
         scene_center: (3,) optional scene center; if None, estimated from cameras
+        restrict_to_inputs: if True, cameras are placed only within the angular
+            range covered by input cameras (+ margin). Use True for Stage 1
+            (visible-region reconstruction). Use False for Stage 2 (full coverage
+            needed for inpainting missing regions).
+        margin_deg: angular margin in degrees beyond the input range (each side).
 
     Returns:
         novel_c2w: (n_cameras, 4, 4) camera-to-world matrices
@@ -172,8 +179,52 @@ def generate_elliptical_cameras(poses: torch.Tensor, n_cameras: int,
     # (median is more robust than mean when one camera is an outlier)
     mean_height = (sc_offsets @ mean_up).median().item()
 
-    # Generate cameras on circle in horizontal plane around scene center
-    angles = torch.linspace(0, 2 * math.pi, n_cameras + 1, device=poses.device)[:-1]
+    # --- Compute angular range ---
+    if restrict_to_inputs:
+        # Find the smallest arc on the orbit circle that contains all input cameras.
+        # Novel cameras are distributed within this arc + margin, so they only
+        # see regions actually covered by input views (where repair makes sense).
+        input_angles = []
+        for i in range(len(poses)):
+            off = positions[i] - scene_center
+            x = (off @ axis1).item()
+            y = (off @ axis2).item()
+            input_angles.append(math.atan2(y, x))
+
+        sorted_angles = sorted(input_angles)
+        n_inp = len(sorted_angles)
+
+        # Find the largest gap between consecutive cameras (the "empty" region)
+        max_gap = -1.0
+        max_gap_idx = 0
+        for k in range(n_inp):
+            a_cur = sorted_angles[k]
+            a_next = sorted_angles[(k + 1) % n_inp]
+            gap = a_next - a_cur if k < n_inp - 1 else (a_next + 2 * math.pi - a_cur)
+            if gap > max_gap:
+                max_gap = gap
+                max_gap_idx = k
+
+        # The covered arc starts AFTER the largest gap
+        arc_start = sorted_angles[(max_gap_idx + 1) % n_inp]
+        arc_end = sorted_angles[max_gap_idx]
+        if arc_end < arc_start:
+            arc_end += 2 * math.pi
+
+        margin_rad = math.radians(margin_deg)
+        arc_start -= margin_rad
+        arc_end += margin_rad
+
+        # If the input cameras already span nearly 360°, just do full orbit
+        arc_span = arc_end - arc_start
+        if arc_span >= 2 * math.pi * 0.9:
+            angles = torch.linspace(0, 2 * math.pi, n_cameras + 1, device=poses.device)[:-1]
+        else:
+            angles = torch.linspace(float(arc_start), float(arc_end),
+                                    n_cameras + 2, device=poses.device)[1:-1]
+    else:
+        angles = torch.linspace(0, 2 * math.pi, n_cameras + 1, device=poses.device)[:-1]
+
     novel_c2w = torch.zeros(n_cameras, 4, 4, device=poses.device)
 
     for i, angle in enumerate(angles):

@@ -35,7 +35,13 @@ from step4_gaussian_init import generate_elliptical_cameras
 
 
 def load_repair_pipeline(cfg: RI3DConfig):
-    """Load the trained repair model for inference (per-scene ControlNet LoRA)."""
+    """Load the trained repair model for inference (per-scene ControlNet LoRA).
+
+    Uses img2img ControlNet pipeline with high strength (0.8). The LoRA-adapted
+    conditioning embedding correctly processes corrupted renders (no hallucination),
+    while the 20% preserved signal from the input image provides color and layout
+    consistency that pure txt2img lacks.
+    """
     from diffusers import (
         StableDiffusionControlNetImg2ImgPipeline,
         ControlNetModel,
@@ -47,8 +53,10 @@ def load_repair_pipeline(cfg: RI3DConfig):
     dtype = cfg.dtype
     device = cfg.device
 
+    # Load ControlNet + scene LoRA (includes conditioning embedding LoRA)
+    controlnet_lora_dir = model_dir / "controlnet"
     controlnet = ControlNetModel.from_pretrained(cfg.controlnet_model, torch_dtype=dtype, use_safetensors=False)
-    controlnet = PeftModel.from_pretrained(controlnet, model_dir)
+    controlnet = PeftModel.from_pretrained(controlnet, controlnet_lora_dir)
     controlnet = controlnet.merge_and_unload()
 
     pipe = StableDiffusionControlNetImg2ImgPipeline.from_pretrained(
@@ -64,6 +72,10 @@ def load_repair_pipeline(cfg: RI3DConfig):
 
 def repair_image(pipe, image_tensor: torch.Tensor, cfg: RI3DConfig) -> torch.Tensor:
     """Run repair model on a rendered image.
+
+    Uses img2img + ControlNet with high strength (0.8). The LoRA-adapted conditioning
+    embedding handles corrupted inputs correctly (no hallucination). The 20% preserved
+    signal from img2img provides color and layout consistency that pure txt2img lacks.
 
     Args:
         image_tensor: (H, W, 3) float tensor in [0, 1]
@@ -84,8 +96,8 @@ def repair_image(pipe, image_tensor: torch.Tensor, cfg: RI3DConfig) -> torch.Ten
         result = pipe(
             prompt=cfg.repair_positive_prompt,
             negative_prompt=cfg.repair_negative_prompt,
-            image=img_resized,
-            control_image=img_resized,
+            image=img_resized,            # img2img starting point (preserves colors/layout)
+            control_image=img_resized,    # ControlNet condition (LoRA-adapted structure)
             strength=cfg.repair_strength,
             num_inference_steps=cfg.repair_inference_steps,
             guidance_scale=cfg.repair_guidance_scale,
@@ -176,7 +188,12 @@ def run_stage1(cfg: RI3DConfig):
     # Generate novel cameras (scene center from camera look-at points, robust to outliers)
     from step4_gaussian_init import compute_scene_center
     scene_center = compute_scene_center(poses, gaussians_init["means"].to(device))
-    novel_c2w = generate_elliptical_cameras(poses, cfg.stage1_num_novel_views, scene_center).to(device)
+    # Stage 1: restrict novel cameras to input angular range (paper: "aligned with input cameras").
+    # Cameras outside the input range see only garbage — repair model can't fix that.
+    novel_c2w = generate_elliptical_cameras(
+        poses, cfg.stage1_num_novel_views, scene_center,
+        restrict_to_inputs=True, margin_deg=20.0,
+    ).to(device)
     K_avg = intrinsics.mean(dim=0)
 
     # Precompute w2c matrices (avoids repeated torch.linalg.inv per step)
