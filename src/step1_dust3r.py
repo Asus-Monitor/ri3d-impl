@@ -12,11 +12,9 @@ import argparse
 from pathlib import Path
 import numpy as np
 import torch
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 
 from config import RI3DConfig
+from utils import save_depth_vis
 
 
 def load_scene_images(scene_dir: Path) -> list[str]:
@@ -94,24 +92,11 @@ def select_views(image_paths: list[str], n_views, scene_dir: Path = None) -> lis
     return selected
 
 
-def save_depth_vis(depth: np.ndarray, path: Path, title: str = ""):
-    """Save a depth map as a colorized PNG."""
-    fig, ax = plt.subplots(1, 1, figsize=(8, 6))
-    valid = depth[depth > 0]
-    if len(valid) > 0:
-        vmin, vmax = np.percentile(valid, [2, 98])
-    else:
-        vmin, vmax = depth.min(), depth.max()
-    im = ax.imshow(depth, cmap="turbo", vmin=vmin, vmax=vmax)
-    ax.set_title(title)
-    ax.axis("off")
-    fig.colorbar(im, ax=ax, fraction=0.046)
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-
-
 def save_pointcloud_ply(path: Path, points: np.ndarray, colors: np.ndarray):
-    """Save point cloud as PLY. points: (N,3), colors: (N,3) uint8."""
+    """Save point cloud as PLY. points: (N,3), colors: (N,3) uint8.
+
+    Uses numpy vectorized formatting instead of Python for-loop.
+    """
     n = points.shape[0]
     header = (
         "ply\n"
@@ -125,12 +110,11 @@ def save_pointcloud_ply(path: Path, points: np.ndarray, colors: np.ndarray):
         "property uchar blue\n"
         "end_header\n"
     )
+    # Combine coords and colors into one array for vectorized write
+    data = np.column_stack([points, colors.astype(np.int32)])
     with open(path, "w") as f:
         f.write(header)
-        for i in range(n):
-            x, y, z = points[i]
-            r, g, b = colors[i]
-            f.write(f"{x:.6f} {y:.6f} {z:.6f} {int(r)} {int(g)} {int(b)}\n")
+        np.savetxt(f, data, fmt="%.6f %.6f %.6f %d %d %d")
 
 
 def compute_triangulation_quality(poses, conf_masks):

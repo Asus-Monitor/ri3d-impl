@@ -31,12 +31,16 @@ from config import RI3DConfig
 from gaussian_trainer import (
     GaussianModel, SSIMLoss, LPIPSLoss, depth_correlation_loss,
     reconstruction_loss, PlateauDetector, compute_background_mask,
-    ensure_depth_convention,
 )
 from step4_gaussian_init import generate_elliptical_cameras, unproject_depth
 from step6_stage1_optim import (
     load_repair_pipeline, repair_image,
     compute_camera_distance_weight, get_opacity_mask,
+)
+from utils import (
+    estimate_mono_depth, clear_mono_depth_cache,
+    prepare_for_pipeline, load_gt_images, load_mono_depths,
+    compute_scene_scale,
 )
 
 
@@ -82,13 +86,11 @@ def inpaint_missing_regions(pipe, rendered_image: torch.Tensor,
     if missing.sum() < 100:
         return rendered_image.clone()
 
-    from step5_repair_model import _prepare_for_pipeline
-
     img_np = (rendered_image.clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
     mask_np = (missing.cpu().numpy() * 255).astype(np.uint8)
 
     img_pil = Image.fromarray(img_np)
-    img_resized, pipe_h, pipe_w = _prepare_for_pipeline(img_pil)
+    img_resized, pipe_h, pipe_w = prepare_for_pipeline(img_pil)
     mask_pil = Image.fromarray(mask_np, mode="L").resize((pipe_w, pipe_h), Image.NEAREST)
 
     with torch.no_grad():
@@ -114,64 +116,21 @@ def inpaint_missing_regions(pipe, rendered_image: torch.Tensor,
     return composite
 
 
-def estimate_mono_depth(image_tensor: torch.Tensor, cfg: RI3DConfig) -> torch.Tensor:
-    """Run monocular depth estimation on an image tensor.
-
-    Returns proper depth (larger = farther). Depth Anything V2 outputs inverse
-    depth (disparity), so we invert it here to match the rendered depth convention.
-
-    Args:
-        image_tensor: (H, W, 3) float tensor in [0, 1]
-    Returns:
-        depth: (H, W) float tensor, proper depth (larger = farther)
-    """
-    from transformers import pipeline as hf_pipeline
-
-    H, W = image_tensor.shape[:2]
-    img_np = (image_tensor.clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
-    img_pil = Image.fromarray(img_np)
-
-    # Use cached pipeline
-    if not hasattr(estimate_mono_depth, "_pipe"):
-        estimate_mono_depth._pipe = hf_pipeline(
-            "depth-estimation", model=cfg.depth_model,
-            device=cfg.device, torch_dtype=cfg.dtype,
-        )
-    with torch.no_grad():
-        result = estimate_mono_depth._pipe(img_pil)
-
-    mono = result["predicted_depth"]
-    if mono.dim() == 3:
-        mono = mono.squeeze(0)
-    mono = F.interpolate(
-        mono.unsqueeze(0).unsqueeze(0).float(),
-        size=(H, W), mode="bilinear", align_corners=False,
-    ).squeeze()
-
-    # Depth Anything V2 outputs inverse depth (closer = larger).
-    # Convert to proper depth (closer = smaller) so that background mask
-    # clustering correctly identifies far objects as background.
-    mono = 1.0 / (mono + 1e-6)
-
-    return mono.to(image_tensor.device)
-
-
-def clear_mono_depth_cache():
-    if hasattr(estimate_mono_depth, "_pipe"):
-        del estimate_mono_depth._pipe
-        torch.cuda.empty_cache()
-
-
 def project_inpainted_to_3d(inpainted_image: torch.Tensor, missing_mask: torch.Tensor,
                               rendered_depth: torch.Tensor, c2w: torch.Tensor,
                               K: torch.Tensor, cfg: RI3DConfig,
                               max_new_gaussians: int = 3000) -> dict | None:
     """Project inpainted pixels into 3D as new Gaussians.
 
-    Uses monocular depth aligned to rendered depth via simple linear fit
-    (fast alternative to full Poisson fusion for the refresh cycle).
+    Per paper Sec 4.3 Stage 2: "We address this by combining the monocular
+    depth in the inpainted regions with the rendered depth using Eq. 2."
+    Uses Poisson fusion (same as step3) with rendered depth as reference
+    and visibility mask as the confidence mask.
+
     Subsamples to max_new_gaussians to prevent unbounded growth.
     """
+    from step3_depth_fusion import align_mono_to_dust3r, solve_poisson_fusion_fast
+
     device = inpainted_image.device
     H, W = inpainted_image.shape[:2]
 
@@ -183,28 +142,28 @@ def project_inpainted_to_3d(inpainted_image: torch.Tensor, missing_mask: torch.T
     # Monocular depth on inpainted image
     mono_depth = estimate_mono_depth(inpainted_image, cfg)  # (H, W) on GPU
 
-    # Align mono depth to rendered depth scale using visible (non-missing) pixels
+    # Visibility mask: where we have valid rendered depth (= high-confidence analog)
     visible = (missing_mask < 0.5)
     rd = rendered_depth.squeeze()
-
-    # Simple linear alignment: mono_aligned = scale * mono + shift
-    # Fitted only on visible pixels where rendered depth is valid
     valid = visible & (rd > 0.01)
     if valid.sum() < 100:
         return None
 
-    mono_valid = mono_depth[valid].float()
-    rd_valid = rd[valid].float()
+    # Per paper: align mono to rendered depth scale, then Poisson fuse (Eq. 2).
+    # rendered_depth plays the role of DUSt3R depth, visibility = confidence mask.
+    rd_np = rd.detach().cpu().numpy().astype(np.float64)
+    mono_np = mono_depth.detach().cpu().numpy().astype(np.float64)
+    mask_np = valid.detach().cpu().numpy().astype(bool)
 
-    # Least-squares: [mono, 1] @ [scale, shift] = rd
-    A = torch.stack([mono_valid, torch.ones_like(mono_valid)], dim=1)
-    result = torch.linalg.lstsq(A, rd_valid)
-    scale, shift = result.solution[0].item(), result.solution[1].item()
+    mono_aligned = align_mono_to_dust3r(mono_np, rd_np, mask_np)
+    fused_np = solve_poisson_fusion_fast(rd_np, mono_aligned, mask_np, cfg.poisson_lambda)
 
-    aligned_depth = (mono_depth.float() * scale + shift).clamp(min=0.01)
-
-    # Composite depth: use rendered depth where visible, aligned mono where missing
-    fused = torch.where(visible, rd, aligned_depth).to(device)
+    # Safety: patch NaN/inf with rendered depth
+    bad = ~np.isfinite(fused_np)
+    if bad.any():
+        fused_np[bad] = rd_np[bad]
+    fused_np = np.maximum(fused_np, 0.01).astype(np.float32)
+    fused = torch.from_numpy(fused_np).to(device)
 
     # Get missing pixel indices
     mask_flat = missing_mask.reshape(-1) > 0.5
@@ -290,29 +249,15 @@ def run_stage2(cfg: RI3DConfig):
     fused_depth_0 = torch.load(out_dir / "fused_depths" / "fused_depth_000.pt", weights_only=True)
     H, W = fused_depth_0.shape
 
-    # Load GT images
-    gt_images = []
-    for ip in image_paths:
-        img = Image.open(ip).convert("RGB").resize((W, H), Image.LANCZOS)
-        gt_images.append(torch.from_numpy(np.array(img)).float().to(device) / 255.0)
-
-    # Load mono depths for reference.
-    # Convert from inverse depth (Depth Anything V2) to proper depth using DUSt3R as reference.
-    mono_depths = []
-    for i in range(n_images):
-        md = torch.load(out_dir / "mono_depths" / f"mono_depth_{i:03d}.pt", weights_only=True)
-        dust3r_d = torch.load(out_dir / "dust3r_depths" / f"depth_{i:03d}.pt", weights_only=True)
-        md = ensure_depth_convention(md.float(), dust3r_d.float())
-        mono_depths.append(md.to(device))
+    # Load GT images and mono depths (shared utility, avoids duplication with step6)
+    gt_images = load_gt_images(image_paths, H, W, device)
+    mono_depths = load_mono_depths(out_dir, n_images, device)
 
     # Initialize model from Stage 1
     model = GaussianModel(stage1_ckpt["gaussians"], device)
     optimizers = model.setup_optimizers(cfg)
 
-    # Compute scene scale from camera positions
-    cam_positions = poses[:, :3, 3]
-    scene_scale = (cam_positions - cam_positions.mean(dim=0)).norm(dim=1).mean().item()
-    scene_scale = max(scene_scale, 0.1)
+    scene_scale = compute_scene_scale(poses)
     print(f"  Scene scale: {scene_scale:.4f}")
     strategy, strategy_state = model.setup_strategy(cfg, scene_scale=scene_scale)
 

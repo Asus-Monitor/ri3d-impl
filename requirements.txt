@@ -27,9 +27,6 @@ scipy>=1.10.0
 # Perceptual loss
 lpips
 
-# Clustering for background mask
-scikit-learn
-
 # Visualization / utils
 matplotlib
 numpy

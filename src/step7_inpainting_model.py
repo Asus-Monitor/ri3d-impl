@@ -296,9 +296,9 @@ def test_inpainting_model(cfg: RI3DConfig):
         axes = axes.reshape(-1, 1)
 
     for j in range(n_test):
-        from step5_repair_model import _prepare_for_pipeline
+        from utils import prepare_for_pipeline
         img_orig = Image.open(image_paths[j]).convert("RGB")
-        img_resized, pipe_h, pipe_w = _prepare_for_pipeline(img_orig)
+        img_resized, pipe_h, pipe_w = prepare_for_pipeline(img_orig)
         mask_np = generate_random_mask(pipe_h, pipe_w, min_ratio=0.15, max_ratio=0.4)
         mask_pil = Image.fromarray((mask_np * 255).astype(np.uint8), mode="L")
 

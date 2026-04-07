@@ -44,7 +44,7 @@ class RI3DConfig:
     # Repair model (ControlNet + UNet LoRA, DPM++ scheduler)
     sd_model: str = "stable-diffusion-v1-5/stable-diffusion-v1-5"
     controlnet_model: str = "lllyasviel/control_v11f1e_sd15_tile"
-    repair_train_iters: int = 2000 # paper Sec 8.1: "fine-tune for 1800 iterations"
+    repair_train_iters: int = 1800 # paper Sec 8.1: "fine-tune for 1800 iterations"
     repair_lr: float = 1e-4
     repair_lora_rank: int = 128
     repair_inference_steps: int = 20   # DPM++ 2M Karras

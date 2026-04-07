@@ -29,7 +29,6 @@ from config import RI3DConfig
 from gaussian_trainer import (
     GaussianModel, SSIMLoss, LPIPSLoss, depth_correlation_loss,
     reconstruction_loss, PlateauDetector, compute_background_mask,
-    ensure_depth_convention,
 )
 from step4_gaussian_init import generate_elliptical_cameras
 
@@ -83,7 +82,7 @@ def repair_image(pipe, image_tensor: torch.Tensor, cfg: RI3DConfig,
     Returns:
         repaired: (H, W, 3) float tensor in [0, 1]
     """
-    from step5_repair_model import _prepare_for_pipeline
+    from utils import prepare_for_pipeline as _prepare_for_pipeline
 
     H, W = image_tensor.shape[:2]
 
@@ -159,30 +158,17 @@ def run_stage1(cfg: RI3DConfig):
     fused_depth_0 = torch.load(out_dir / "fused_depths" / "fused_depth_000.pt", weights_only=True)
     H, W = fused_depth_0.shape
 
-    # Load GT images
-    gt_images = []
-    for ip in image_paths:
-        img = Image.open(ip).convert("RGB").resize((W, H), Image.LANCZOS)
-        gt_images.append(torch.from_numpy(np.array(img)).float().to(device) / 255.0)
-
-    # Load mono depth for depth correlation loss.
-    # Depth Anything V2 outputs inverse depth (closer = larger). Convert to
-    # proper depth (closer = smaller) using DUSt3R depth as reference.
-    mono_depths = []
-    for i in range(n_images):
-        md = torch.load(out_dir / "mono_depths" / f"mono_depth_{i:03d}.pt", weights_only=True)
-        dust3r_d = torch.load(out_dir / "dust3r_depths" / f"depth_{i:03d}.pt", weights_only=True)
-        md = ensure_depth_convention(md.float(), dust3r_d.float())
-        mono_depths.append(md.to(device))
+    # Load GT images and mono depths (shared utility, avoids duplication with step8)
+    from utils import load_gt_images, load_mono_depths
+    gt_images = load_gt_images(image_paths, H, W, device)
+    mono_depths = load_mono_depths(out_dir, n_images, device)
 
     # Initialize model
     model = GaussianModel(gaussians_init, device)
     optimizers = model.setup_optimizers(cfg)
 
-    # Compute scene scale from camera positions (affects pruning thresholds)
-    cam_positions = poses[:, :3, 3]
-    scene_scale = (cam_positions - cam_positions.mean(dim=0)).norm(dim=1).mean().item()
-    scene_scale = max(scene_scale, 0.1)
+    from utils import compute_scene_scale
+    scene_scale = compute_scene_scale(poses)
     print(f"  Scene scale: {scene_scale:.4f}")
     strategy, strategy_state = model.setup_strategy(cfg, scene_scale=scene_scale)
 
@@ -240,7 +226,7 @@ def run_stage1(cfg: RI3DConfig):
                     # Background mask from monocular depth of REPAIRED image (paper Sec 4.3):
                     # "We obtain this background mask by applying agglomerative clustering
                     #  on the monocular depth estimated for repaired images."
-                    from step8_stage2_optim import estimate_mono_depth
+                    from utils import estimate_mono_depth
                     mono_d = estimate_mono_depth(repaired, cfg)
                     cached_bg_masks[j] = get_background_mask(
                         mono_d, cfg

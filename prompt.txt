@@ -1,0 +1,5 @@
+this project is implementing paper.md please read it fully. after you done this, read the entire codebase 
+ and see if its implemented properly in accordance to paper. if you find duplicated code that is            
+implemented slightly differently at different places, read the paper to make a correct unified approach. if 
+ possible prefer / see if code that is implemented, can be done package more cleanly and effienciently.     
+find and fix any slowdowns while keeping in mind the accordance to paper.md 

@@ -28,21 +28,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from config import RI3DConfig
-
-
-def save_depth_vis(depth: np.ndarray, path: Path, title: str = ""):
-    fig, ax = plt.subplots(1, 1, figsize=(8, 6))
-    valid = depth[depth > 0]
-    if len(valid) > 0:
-        vmin, vmax = np.percentile(valid, [2, 98])
-    else:
-        vmin, vmax = depth.min(), depth.max()
-    im = ax.imshow(depth, cmap="turbo", vmin=vmin, vmax=vmax)
-    ax.set_title(title)
-    ax.axis("off")
-    fig.colorbar(im, ax=ax, fraction=0.046)
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
+from utils import save_depth_vis
 
 
 def save_comparison(depths: dict[str, np.ndarray], path: Path, suptitle: str = ""):
@@ -141,57 +127,6 @@ def align_mono_to_dust3r(mono_raw: np.ndarray, dust3r: np.ndarray, mask: np.ndar
     aligned = np.clip(aligned, d_min, d_max)
 
     return aligned
-
-
-def solve_poisson_fusion(dust3r: np.ndarray, mono_aligned: np.ndarray,
-                          mask: np.ndarray, lam: float = 10.0) -> np.ndarray:
-    """Solve the Poisson fusion objective (Eq. 2 from paper).
-
-    d* = argmin_d [ M ⊙ ||d - d_D||² + λ ||∇d - ∇d_M||² ]
-
-    Setting gradient to zero gives a sparse linear system:
-      (M + λ L) d = M ⊙ d_D + λ div(∇d_M)
-    where L is the discrete Laplacian.
-    """
-    H, W = dust3r.shape
-    N = H * W
-
-    # Index mapping
-    def idx(r, c):
-        return r * W + c
-
-    # Build sparse Laplacian and divergence of mono gradient
-    # Using 4-connected neighbors
-    rows, cols, vals = [], [], []
-    rhs = np.zeros(N)
-
-    for r in range(H):
-        for c in range(W):
-            i = idx(r, c)
-            n_neighbors = 0
-
-            # Data term: M(i) * (d(i) - d_D(i)) contributes M(i) on diagonal, M(i)*d_D(i) to rhs
-            if mask[r, c]:
-                rows.append(i); cols.append(i); vals.append(1.0)
-                rhs[i] += dust3r[r, c]
-
-            # Gradient term: λ * sum_neighbors (d(i) - d(j) - (d_M(i) - d_M(j)))²
-            # Contributes λ on diagonal per neighbor, -λ off-diagonal
-            for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
-                nr, nc = r + dr, c + dc
-                if 0 <= nr < H and 0 <= nc < W:
-                    j = idx(nr, nc)
-                    n_neighbors += 1
-                    rows.append(i); cols.append(i); vals.append(lam)
-                    rows.append(i); cols.append(j); vals.append(-lam)
-                    # RHS: λ * (d_M(i) - d_M(j))
-                    rhs[i] += lam * (mono_aligned[r, c] - mono_aligned[nr, nc])
-
-    A = sparse.csr_matrix((vals, (rows, cols)), shape=(N, N))
-
-    print(f"    Solving {N}x{N} sparse system...")
-    d_flat = spsolve(A, rhs)
-    return d_flat.reshape(H, W)
 
 
 def solve_poisson_fusion_fast(dust3r: np.ndarray, mono_aligned: np.ndarray,

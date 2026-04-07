@@ -99,11 +99,8 @@ def generate_leave_one_out_data(cfg: RI3DConfig):
 
         model = GaussianModel(gaussians_init, device)
         optimizers = model.setup_optimizers(cfg)
-        # Compute scene scale from camera positions (same as Stage 1/2)
-        cam_positions = poses[:, :3, 3]
-        loo_scene_scale = max(
-            (cam_positions - cam_positions.mean(dim=0)).norm(dim=1).mean().item(), 0.1
-        )
+        from utils import compute_scene_scale
+        loo_scene_scale = compute_scene_scale(poses)
         strategy, strategy_state = model.setup_strategy(cfg, scene_scale=loo_scene_scale)
 
         w2c_lo = w2c_all[left_out_idx]
@@ -442,24 +439,9 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
 
 
 def _prepare_for_pipeline(image: Image.Image, target_short_side: int = 512) -> tuple[Image.Image, int, int]:
-    """Resize preserving aspect ratio for pipeline input.
-
-    Matches the training preprocessing: smallest dim → target_short_side,
-    then dims rounded to multiples of 8 for the VAE.
-    Returns (resized_pil, pipe_h, pipe_w).
-    """
-    W_orig, H_orig = image.size
-    if H_orig <= W_orig:
-        pipe_h = target_short_side
-        pipe_w = int(W_orig * target_short_side / H_orig)
-    else:
-        pipe_w = target_short_side
-        pipe_h = int(H_orig * target_short_side / W_orig)
-    # Round to multiples of 8 (VAE latent alignment)
-    pipe_h = (pipe_h // 8) * 8
-    pipe_w = (pipe_w // 8) * 8
-    resized = image.resize((pipe_w, pipe_h), Image.LANCZOS)
-    return resized, pipe_h, pipe_w
+    """Deprecated: use utils.prepare_for_pipeline instead. Kept for import compat."""
+    from utils import prepare_for_pipeline
+    return prepare_for_pipeline(image, target_short_side)
 
 
 def test_repair_model(cfg: RI3DConfig):

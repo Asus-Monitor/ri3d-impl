@@ -18,7 +18,10 @@
       "WebFetch(domain:astraml.com)",
       "Bash(ls -la /home/vy/ri3d-impl/output/bonsai/stage1_renders/final_novel_00*.png)",
       "Bash(ls /home/vy/ri3d-impl/output/bonsai/stage1_renders/step*.png)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(xargs -I {} basename {})",
+      "Bash(wc:*)",
+      "Bash(xargs cat:*)"
     ]
   }
 }

@@ -8,22 +8,9 @@ from pathlib import Path
 import numpy as np
 import torch
 from PIL import Image
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 
 from config import RI3DConfig
-
-
-def save_depth_vis(depth: np.ndarray, path: Path, title: str = ""):
-    fig, ax = plt.subplots(1, 1, figsize=(8, 6))
-    vmin, vmax = np.percentile(depth, [2, 98])
-    im = ax.imshow(depth, cmap="turbo", vmin=vmin, vmax=vmax)
-    ax.set_title(title)
-    ax.axis("off")
-    fig.colorbar(im, ax=ax, fraction=0.046)
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
+from utils import save_depth_vis
 
 
 def run_mono_depth(cfg: RI3DConfig, depth_pipe=None):
