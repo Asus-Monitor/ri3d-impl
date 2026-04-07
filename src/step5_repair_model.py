@@ -1,4 +1,4 @@
-"""Step 5: Train the Repair Model (ControlNet + LoRA + LCM).
+"""Step 5: Train the Repair Model (ControlNet + LoRA).
 
 Per the paper (Sec 4.2, 8.1):
   1. Leave-one-out: create N subsets of N-1 images, train N 3DGS reps

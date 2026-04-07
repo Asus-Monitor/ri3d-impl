@@ -24,16 +24,16 @@ import matplotlib.pyplot as plt
 from config import RI3DConfig
 
 
-def generate_random_mask(H: int, W: int, min_ratio: float = 0.1,
-                          max_ratio: float = 0.6) -> np.ndarray:
+def generate_random_mask(H: int, W: int, min_ratio: float = 0.2,
+                          max_ratio: float = 0.65) -> np.ndarray:
     """Generate a random rectangular mask for testing.
     Returns binary mask where 1 = masked (to inpaint), 0 = visible.
     """
     mask = np.zeros((H, W), dtype=np.float32)
-    n_rects = random.randint(1, 4)
+    n_rects = random.randint(1, 3)
     for _ in range(n_rects):
-        h = int(H * random.uniform(0.1, 0.8))
-        w = int(W * random.uniform(0.1, 0.8))
+        h = int(H * random.uniform(min_ratio, max_ratio))
+        w = int(W * random.uniform(min_ratio, max_ratio))
         y = random.randint(0, H - h)
         x = random.randint(0, W - w)
         mask[y:y+h, x:x+w] = 1.0
@@ -148,6 +148,7 @@ def train_inpainting_model(cfg: RI3DConfig, shared_components=None):
         target_modules=[
             "to_q", "to_v", "to_k", "to_out.0",  # self/cross attention
             "proj_in", "proj_out",                  # transformer projections
+            "conv1", "conv2",                       # resnet convolutions (texture synthesis)
         ],
         lora_dropout=0.05,
     )
@@ -169,6 +170,10 @@ def train_inpainting_model(cfg: RI3DConfig, shared_components=None):
         batch_size = 1
     n_steps = (n_iters + batch_size - 1) // batch_size
     text_embeds_b = text_embeds.expand(batch_size, -1, -1)
+
+    # GradScaler prevents fp16 gradient underflow. Without it, LoRA parameters
+    # get zero gradients and never learn (same issue as repair model training).
+    scaler = torch.amp.GradScaler("cuda")
 
     print(f"Training inpainting LoRA for {n_iters} iterations (batch={batch_size}) "
           f"on {n_images} images...")
@@ -231,8 +236,9 @@ def train_inpainting_model(cfg: RI3DConfig, shared_components=None):
         noise_pred = unet(unet_input, t_b, encoder_hidden_states=text_embeds_b[:actual_bs]).sample
 
         loss = F.mse_loss(noise_pred.float(), noise_b.float())
-        loss.backward()
-        optimizer.step()
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
         optimizer.zero_grad(set_to_none=True)
 
         iter_count += actual_bs
@@ -310,8 +316,8 @@ def test_inpainting_model(cfg: RI3DConfig):
                 height=pipe_h,
                 width=pipe_w,
                 strength=cfg.inpainting_strength,
-                num_inference_steps=cfg.lcm_inference_steps,
-                guidance_scale=cfg.lcm_guidance_scale,
+                num_inference_steps=cfg.inpainting_inference_steps,
+                guidance_scale=cfg.inpainting_guidance_scale,
             ).images[0]
 
         img_np = np.array(img_resized)

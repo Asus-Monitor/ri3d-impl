@@ -45,7 +45,7 @@ from utils import (
 
 
 def load_inpainting_pipeline(cfg: RI3DConfig):
-    """Load the trained inpainting model for inference (per-scene LoRA)."""
+    """Load the trained inpainting model for inference (per-scene LoRA + LCM)."""
     from diffusers import StableDiffusionInpaintPipeline, LCMScheduler
     from peft import PeftModel
 
@@ -101,8 +101,8 @@ def inpaint_missing_regions(pipe, rendered_image: torch.Tensor,
             height=pipe_h,
             width=pipe_w,
             strength=cfg.inpainting_strength,
-            num_inference_steps=cfg.lcm_inference_steps,
-            guidance_scale=cfg.lcm_guidance_scale,
+            num_inference_steps=cfg.inpainting_inference_steps,
+            guidance_scale=cfg.inpainting_guidance_scale,
         ).images[0]
 
     result_np = np.array(result.resize((W, H), Image.LANCZOS)).astype(np.float32) / 255.0

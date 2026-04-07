@@ -54,11 +54,11 @@ class RI3DConfig:
     repair_positive_prompt: str = "best quality, sharp detail"
     repair_negative_prompt: str = "blur, lowres, artifacts, distortion, worst quality"
 
-    # LCM (used for inpainting only — incompatible with ControlNet)
+    # Inpainting inference (LCM for speed)
     lcm_lora: str = "latent-consistency/lcm-lora-sdv1-5"
-    lcm_inference_steps: int = 8
-    lcm_guidance_scale: float = 1.0   # no CFG amplification — empty prompt means no text direction
-    inpainting_strength: float = 0.8  # img2img strength — high since masked areas need full generation
+    inpainting_inference_steps: int = 8   # LCM steps
+    inpainting_guidance_scale: float = 1.0   # no CFG — empty prompt means no text direction
+    inpainting_strength: float = 1.0  # full noise in masked regions for maximum generation freedom
 
     # Leave-one-out training for repair
     loo_initial_iters: int = 6000  # iters before re-adding left-out view
@@ -67,7 +67,7 @@ class RI3DConfig:
     loo_render_scale: float = 0.5     # train LOO 3DGS at lower res for speed (snapshots use full res)
 
     # Inpainting model
-    inpainting_train_iters: int = 200 # paper Sec 8.2: "fine-tune the model for 2000 iterations"
+    inpainting_train_iters: int = 50 # paper Sec 8.2: "fine-tune the model for 2000 iterations"
     inpainting_lr: float = 1e-4
     inpainting_lora_rank: int = 96
 
