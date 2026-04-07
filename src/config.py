@@ -70,7 +70,7 @@ class RI3DConfig:
     # Paper uses full UNet fine-tune; we use LoRA (attention + conv) for limited VRAM.
     inpainting_train_iters: int = 500 # paper Sec 8.2: "fine-tune the model for 2000 iterations"
     inpainting_lr: float = 2e-4        # RealFill standard UNet LoRA lr
-    inpainting_lora_rank: int = 16     # attention + conv LoRA to approximate full fine-tune
+    inpainting_lora_rank: int = 48     # attention + conv LoRA to approximate full fine-tune
 
     # Stage 1 optimization
     stage1_max_iters: int = 4000
