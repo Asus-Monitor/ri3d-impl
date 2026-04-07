@@ -169,11 +169,16 @@ def generate_elliptical_cameras(poses: torch.Tensor, n_cameras: int,
     axis1 = axis1 / axis1.norm()
     axis2 = look_horiz  # toward the scene
 
-    # Orbit radius: horizontal distance from scene center to input cameras
+    # Elliptical orbit radii: per-axis distances from scene center to input cameras.
+    # Paper: "along an elliptical path aligned with the input cameras."
+    # Computing separate radii along axis1 and axis2 produces an ellipse that
+    # matches the input camera distribution (e.g., elongated for forward-facing scenes).
     sc_offsets = positions - scene_center.unsqueeze(0)  # (N, 3)
     horiz_offsets = sc_offsets - (sc_offsets @ mean_up).unsqueeze(-1) * mean_up.unsqueeze(0)
-    orbit_radius = horiz_offsets.norm(dim=1).mean().item()
-    orbit_radius = max(orbit_radius * 1.1, 0.3)
+    proj1 = (horiz_offsets @ axis1).abs()  # distances along axis1
+    proj2 = (horiz_offsets @ axis2).abs()  # distances along axis2
+    radius1 = max(proj1.mean().item() * 1.1, 0.3)
+    radius2 = max(proj2.mean().item() * 1.1, 0.3)
 
     # Height: median camera displacement from scene center along up direction
     # (median is more robust than mean when one camera is an outlier)
@@ -228,10 +233,10 @@ def generate_elliptical_cameras(poses: torch.Tensor, n_cameras: int,
     novel_c2w = torch.zeros(n_cameras, 4, 4, device=poses.device)
 
     for i, angle in enumerate(angles):
-        # Position on horizontal orbit
+        # Position on elliptical orbit (per-axis radii)
         pos = (scene_center
-               + orbit_radius * torch.cos(angle) * axis1
-               + orbit_radius * torch.sin(angle) * axis2
+               + radius1 * torch.cos(angle) * axis1
+               + radius2 * torch.sin(angle) * axis2
                + mean_height * mean_up)
 
         # Look-at: forward direction from camera toward scene center

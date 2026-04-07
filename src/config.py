@@ -44,7 +44,7 @@ class RI3DConfig:
     # Repair model (ControlNet + UNet LoRA, DPM++ scheduler)
     sd_model: str = "stable-diffusion-v1-5/stable-diffusion-v1-5"
     controlnet_model: str = "lllyasviel/control_v11f1e_sd15_tile"
-    repair_train_iters: int = 1800 # paper Sec 8.1: "fine-tune for 1800 iterations"
+    repair_train_iters: int = 2000 # paper Sec 8.1: "fine-tune for 1800 iterations"
     repair_lr: float = 1e-4
     repair_lora_rank: int = 128
     repair_inference_steps: int = 20   # DPM++ 2M Karras
@@ -58,7 +58,7 @@ class RI3DConfig:
     lcm_lora: str = "latent-consistency/lcm-lora-sdv1-5"
     lcm_inference_steps: int = 8
     lcm_guidance_scale: float = 1.0   # no CFG amplification — empty prompt means no text direction
-    inpainting_strength: float = 0.65  # img2img strength — high since masked areas need full generation
+    inpainting_strength: float = 0.8  # img2img strength — high since masked areas need full generation
 
     # Leave-one-out training for repair
     loo_initial_iters: int = 6000  # iters before re-adding left-out view
@@ -67,9 +67,9 @@ class RI3DConfig:
     loo_render_scale: float = 0.5     # train LOO 3DGS at lower res for speed (snapshots use full res)
 
     # Inpainting model
-    inpainting_train_iters: int = 50 # paper Sec 8.2: "fine-tune the model for 2000 iterations"
+    inpainting_train_iters: int = 200 # paper Sec 8.2: "fine-tune the model for 2000 iterations"
     inpainting_lr: float = 1e-4
-    inpainting_lora_rank: int = 64
+    inpainting_lora_rank: int = 96
 
     # Stage 1 optimization
     stage1_max_iters: int = 4000

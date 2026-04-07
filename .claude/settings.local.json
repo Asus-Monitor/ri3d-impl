@@ -21,7 +21,8 @@
       "Bash(ls:*)",
       "Bash(xargs -I {} basename {})",
       "Bash(wc:*)",
-      "Bash(xargs cat:*)"
+      "Bash(xargs cat:*)",
+      "Bash(echo \"EXIT: $?\")"
     ]
   }
 }

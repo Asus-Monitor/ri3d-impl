@@ -149,7 +149,7 @@ def train_inpainting_model(cfg: RI3DConfig, shared_components=None):
             "to_q", "to_v", "to_k", "to_out.0",  # self/cross attention
             "proj_in", "proj_out",                  # transformer projections
         ],
-        lora_dropout=0.0,
+        lora_dropout=0.05,
     )
     unet = get_peft_model(unet, lora_config)
     unet.print_trainable_parameters()

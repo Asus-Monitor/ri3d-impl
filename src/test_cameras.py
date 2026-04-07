@@ -37,8 +37,10 @@ def generate_elliptical_cameras(poses, n_cameras, scene_center=None):
 
     sc_offsets = positions - scene_center.unsqueeze(0)
     horiz_offsets = sc_offsets - (sc_offsets @ mean_up).unsqueeze(-1) * mean_up.unsqueeze(0)
-    orbit_radius = horiz_offsets.norm(dim=1).mean().item()
-    orbit_radius = max(orbit_radius * 1.1, 0.3)
+    proj1 = (horiz_offsets @ axis1).abs()
+    proj2 = (horiz_offsets @ axis2).abs()
+    radius1 = max(proj1.mean().item() * 1.1, 0.3)
+    radius2 = max(proj2.mean().item() * 1.1, 0.3)
 
     mean_height = (sc_offsets @ mean_up).median().item()
 
@@ -47,8 +49,8 @@ def generate_elliptical_cameras(poses, n_cameras, scene_center=None):
 
     for i, angle in enumerate(angles):
         pos = (scene_center
-               + orbit_radius * torch.cos(angle) * axis1
-               + orbit_radius * torch.sin(angle) * axis2
+               + radius1 * torch.cos(angle) * axis1
+               + radius2 * torch.sin(angle) * axis2
                + mean_height * mean_up)
 
         fwd = scene_center - pos
