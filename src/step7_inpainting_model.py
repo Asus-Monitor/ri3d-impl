@@ -5,6 +5,7 @@ Per the paper (Sec 4.2, 8.2):
   - This personalizes the model so hallucinated content matches the scene's visual style
   - Images are resized so smallest dim = 512, then random 512x512 crop
   - Fine-tune for 2000 iterations per scene
+  - Paper uses full UNet fine-tune; we approximate with LoRA (attention + conv)
 
 Outputs:
   - outputs/<scene>/inpainting_model/   per-scene LoRA weights
@@ -23,14 +24,15 @@ import matplotlib.pyplot as plt
 
 from config import RI3DConfig
 
+random.seed(42)
 
-def generate_random_mask(H: int, W: int, min_ratio: float = 0.2,
-                          max_ratio: float = 0.65) -> np.ndarray:
+def generate_random_mask(H: int, W: int, min_ratio: float = 0.15,
+                          max_ratio: float = 0.5) -> np.ndarray:
     """Generate a random rectangular mask for testing.
     Returns binary mask where 1 = masked (to inpaint), 0 = visible.
     """
     mask = np.zeros((H, W), dtype=np.float32)
-    n_rects = random.randint(1, 3)
+    n_rects = random.randint(1, 4)
     for _ in range(n_rects):
         h = int(H * random.uniform(min_ratio, max_ratio))
         w = int(W * random.uniform(min_ratio, max_ratio))
@@ -106,6 +108,9 @@ def train_inpainting_model(cfg: RI3DConfig, shared_components=None):
             tokens = tokenizer("", padding="max_length", max_length=77,
                                return_tensors="pt").input_ids.to(device)
             text_embeds = text_encoder(tokens)[0]
+        # Free text encoder — only the cached embeddings are needed for training
+        del text_encoder, tokenizer
+        torch.cuda.empty_cache()
     else:
         vae = shared_components["vae"]
         text_embeds = shared_components["text_embeds"]
@@ -113,6 +118,7 @@ def train_inpainting_model(cfg: RI3DConfig, shared_components=None):
 
     # ------------------------------------------------------------------
     # Pre-compute: cache images on GPU, pre-encode clean latents through VAE.
+    # Also pre-compute horizontally flipped versions to double effective data.
     # Crops are 8px-aligned so clean_latent can be cropped in latent space
     # (eliminates 1 of 2 VAE encodes per step). Masked image still needs
     # per-step VAE encode since the mask changes each step.
@@ -137,18 +143,30 @@ def train_inpainting_model(cfg: RI3DConfig, shared_components=None):
             lat = vae.encode(img_t.unsqueeze(0) * 2 - 1).latent_dist.sample() * scale
             clean_latents_gpu.append(lat.squeeze(0))
 
+        # Horizontal flip augmentation — doubles effective training data.
+        # Must encode flipped images through VAE separately (conv is not flip-equivariant).
+        n_orig = len(img_tensors_gpu)
+        for i in range(n_orig):
+            img_flip = img_tensors_gpu[i].flip(-1)
+            img_tensors_gpu.append(img_flip)
+            lat_flip = vae.encode(img_flip.unsqueeze(0) * 2 - 1).latent_dist.sample() * scale
+            clean_latents_gpu.append(lat_flip.squeeze(0))
+
     n_images = len(img_tensors_gpu)
+    print(f"  {n_orig} originals + {n_orig} flips = {n_images} effective training images")
 
     # Fresh UNet + LoRA for this scene
+    # Paper uses full fine-tune; LoRA with attention + conv layers approximates it.
+    # Conv layers are critical — they handle texture synthesis (the "how things look"),
+    # while attention handles layout/semantics (the "what goes where").
     unet = UNet2DConditionModel.from_pretrained(inpaint_model_id, subfolder="unet",
                                                  torch_dtype=dtype).to(device)
     lora_config = LoraConfig(
         r=cfg.inpainting_lora_rank,
-        lora_alpha=cfg.inpainting_lora_rank,
+        lora_alpha=2 * cfg.inpainting_lora_rank,  # alpha = 2*rank for stronger personalization
         target_modules=[
-            "to_q", "to_v", "to_k", "to_out.0",  # self/cross attention
-            "proj_in", "proj_out",                  # transformer projections
-            "conv1", "conv2",                       # resnet convolutions (texture synthesis)
+            "to_q", "to_v", "to_k", "to_out.0",  # attention: semantics + layout
+            "conv1", "conv2",                       # resnet convolutions: texture synthesis
         ],
         lora_dropout=0.05,
     )
@@ -237,6 +255,8 @@ def train_inpainting_model(cfg: RI3DConfig, shared_components=None):
 
         loss = F.mse_loss(noise_pred.float(), noise_b.float())
         scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(unet.parameters(), 1.0)
         scaler.step(optimizer)
         scaler.update()
         optimizer.zero_grad(set_to_none=True)
@@ -261,12 +281,12 @@ def train_inpainting_model(cfg: RI3DConfig, shared_components=None):
 
     del unet, optimizer, img_tensors_gpu, clean_latents_gpu
     if _owns_components:
-        del text_encoder, vae
+        del vae
     torch.cuda.empty_cache()
 
 
 def test_inpainting_model(cfg: RI3DConfig):
-    """Test inpainting model on this scene's images."""
+    """Test inpainting model with multiple mask positions per image."""
     from diffusers import StableDiffusionInpaintPipeline, LCMScheduler
     from peft import PeftModel
 
@@ -295,46 +315,60 @@ def test_inpainting_model(cfg: RI3DConfig):
     pipe.safety_checker = None
 
     image_paths = cfg.load_image_paths()
-    n_test = min(3, len(image_paths))
+    n_images = len(image_paths)
 
-    fig, axes = plt.subplots(3, n_test, figsize=(6 * n_test, 18))
-    if n_test == 1:
+    # Test each image with 3 different mask configurations (varied positions + sizes)
+    masks_per_image = 3
+    total_cols = n_images * masks_per_image
+    fig, axes = plt.subplots(3, total_cols, figsize=(5 * total_cols, 15))
+    if total_cols == 1:
         axes = axes.reshape(-1, 1)
 
-    for j in range(n_test):
-        from utils import prepare_for_pipeline
-        img_orig = Image.open(image_paths[j]).convert("RGB")
+    mask_configs = [
+        (0.10, 0.25),  # small masks
+        (0.20, 0.40),  # medium masks
+        (0.35, 0.60),  # large masks
+    ]
+
+    from utils import prepare_for_pipeline
+
+    for i in range(n_images):
+        img_orig = Image.open(image_paths[i]).convert("RGB")
         img_resized, pipe_h, pipe_w = prepare_for_pipeline(img_orig)
-        mask_np = generate_random_mask(pipe_h, pipe_w, min_ratio=0.15, max_ratio=0.4)
-        mask_pil = Image.fromarray((mask_np * 255).astype(np.uint8), mode="L")
-
-        with torch.no_grad():
-            result = pipe(
-                prompt="",
-                image=img_resized,
-                mask_image=mask_pil,
-                height=pipe_h,
-                width=pipe_w,
-                strength=cfg.inpainting_strength,
-                num_inference_steps=cfg.inpainting_inference_steps,
-                guidance_scale=cfg.inpainting_guidance_scale,
-            ).images[0]
-
         img_np = np.array(img_resized)
-        masked_np = img_np.copy()
-        masked_np[mask_np > 0.5] = [128, 128, 128]
 
-        axes[0, j].imshow(img_np)
-        axes[0, j].set_title("Original")
-        axes[0, j].axis("off")
-        axes[1, j].imshow(masked_np)
-        axes[1, j].set_title("Masked")
-        axes[1, j].axis("off")
-        axes[2, j].imshow(result)
-        axes[2, j].set_title("Inpainted")
-        axes[2, j].axis("off")
+        for j, (min_r, max_r) in enumerate(mask_configs):
+            col = i * masks_per_image + j
+            mask_np = generate_random_mask(pipe_h, pipe_w, min_ratio=min_r, max_ratio=max_r)
+            mask_pil = Image.fromarray((mask_np * 255).astype(np.uint8), mode="L")
 
-    fig.suptitle(f"Inpainting Test — {cfg.scene_name}")
+            with torch.no_grad():
+                result = pipe(
+                    prompt="",
+                    image=img_resized,
+                    mask_image=mask_pil,
+                    height=pipe_h,
+                    width=pipe_w,
+                    strength=cfg.inpainting_strength,
+                    num_inference_steps=cfg.inpainting_inference_steps,
+                    guidance_scale=cfg.inpainting_guidance_scale,
+                ).images[0]
+
+            masked_np = img_np.copy()
+            masked_np[mask_np > 0.5] = [128, 128, 128]
+            size_label = ["small", "medium", "large"][j]
+
+            axes[0, col].imshow(img_np)
+            axes[0, col].set_title(f"Original (img {i})")
+            axes[0, col].axis("off")
+            axes[1, col].imshow(masked_np)
+            axes[1, col].set_title(f"Masked ({size_label})")
+            axes[1, col].axis("off")
+            axes[2, col].imshow(result)
+            axes[2, col].set_title(f"Inpainted ({size_label})")
+            axes[2, col].axis("off")
+
+    fig.suptitle(f"Inpainting Test — {cfg.scene_name}", fontsize=16)
     fig.savefig(test_dir / "inpainting_test_results.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
 

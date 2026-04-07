@@ -27,6 +27,7 @@ import matplotlib.pyplot as plt
 from config import RI3DConfig
 from gaussian_trainer import GaussianModel
 
+random.seed(42)
 
 def generate_leave_one_out_data(cfg: RI3DConfig):
     """Generate corrupted/clean image pairs for a single scene using leave-one-out."""

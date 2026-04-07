@@ -22,7 +22,9 @@
       "Bash(xargs -I {} basename {})",
       "Bash(wc:*)",
       "Bash(xargs cat:*)",
-      "Bash(echo \"EXIT: $?\")"
+      "Bash(echo \"EXIT: $?\")",
+      "Bash(curl -s \"https://raw.githubusercontent.com/thuanz123/realfill/main/train_realfill.py\")",
+      "Bash(curl -s \"https://raw.githubusercontent.com/thuanz123/realfill/main/README.md\")"
     ]
   }
 }

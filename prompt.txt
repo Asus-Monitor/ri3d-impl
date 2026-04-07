@@ -3,3 +3,9 @@ this project is implementing paper.md please read it fully. after you done this,
 implemented slightly differently at different places, read the paper to make a correct unified approach. if 
  possible prefer / see if code that is implemented, can be done package more cleanly and effienciently.     
 find and fix any slowdowns while keeping in mind the accordance to paper.md 
+
+
+hey please read paper.md and the codebase to understand what this is about. im having an issue with teh step7 inpainting model, which is that its not     
+inpainting properly you can see for yourself in the inpainting test, for example the plant disappears or the rug becomes a different size. We need much     
+much consistency as possible, while inpainting properly. make sure that the lora train / inference parameters are set correctly as per industry standard    
+and that the target modules make sense! It is very important to me that you fix this, work the hardest you ever did to solve this issue    

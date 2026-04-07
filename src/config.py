@@ -66,10 +66,11 @@ class RI3DConfig:
     loo_snapshot_interval: int = 500   # snapshot corrupted renders every N iters after re-add
     loo_render_scale: float = 0.5     # train LOO 3DGS at lower res for speed (snapshots use full res)
 
-    # Inpainting model
-    inpainting_train_iters: int = 50 # paper Sec 8.2: "fine-tune the model for 2000 iterations"
-    inpainting_lr: float = 1e-4
-    inpainting_lora_rank: int = 96
+    # Inpainting model (RealFill-style, per paper Sec 8.2)
+    # Paper uses full UNet fine-tune; we use LoRA (attention + conv) for limited VRAM.
+    inpainting_train_iters: int = 500 # paper Sec 8.2: "fine-tune the model for 2000 iterations"
+    inpainting_lr: float = 2e-4        # RealFill standard UNet LoRA lr
+    inpainting_lora_rank: int = 16     # attention + conv LoRA to approximate full fine-tune
 
     # Stage 1 optimization
     stage1_max_iters: int = 4000
