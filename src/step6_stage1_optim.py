@@ -36,10 +36,11 @@ from step4_gaussian_init import generate_elliptical_cameras
 def load_repair_pipeline(cfg: RI3DConfig):
     """Load the trained repair model for inference (per-scene ControlNet LoRA).
 
-    Uses img2img ControlNet pipeline with high strength (0.8). The LoRA-adapted
-    conditioning embedding correctly processes corrupted renders (no hallucination),
-    while the 20% preserved signal from the input image provides color and layout
-    consistency that pure txt2img lacks.
+    Uses img2img ControlNet pipeline. The corrupted render is both the img2img
+    input (preserving coarse color/layout through retained signal) and the
+    ControlNet condition (providing structural guidance). Strength controls
+    how much of the original image survives noise — moderate values destroy
+    fine artifacts while preserving global scene consistency.
     """
     from diffusers import (
         StableDiffusionControlNetImg2ImgPipeline,

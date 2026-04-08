@@ -80,14 +80,17 @@ def generate_leave_one_out_data(cfg: RI3DConfig):
 
     torch.backends.cudnn.benchmark = True
 
-    # Snapshot only during phase 2 (after re-adding the left-out view), per paper Sec 4.2.
-    # Phase 1 renders are maximally corrupted (model never saw this view) — including
-    # them poisons LoRA training with impossible extreme-corruption→clean mappings.
-    # Phase 2 gives progressive corruption: moderate→mild, matching what the repair
-    # model actually encounters during Stage 1 (heavy corruption is masked out by M_α).
+    # Phase 2 snapshots: progressive corruption (moderate→mild) as the model re-learns
+    # the left-out view. These cover the mid-to-late Stage 1 corruption levels.
     snapshot_steps = set(
         range(cfg.loo_initial_iters, cfg.loo_total_iters, cfg.loo_snapshot_interval)
     )
+    # Phase 1 snapshots: heavy corruption from BEFORE re-adding left-out view.
+    # Critical: the repair model encounters similarly heavy corruption at the START
+    # of Stage 1 optimization (step 0 renders). Without these, the model has never
+    # seen heavy-corruption→clean mappings and falls back on the pretrained tile
+    # ControlNet behavior, which preserves the artifacts instead of removing them.
+    snapshot_steps.update(cfg.loo_phase1_snapshots)
 
     all_indices = list(range(n_images))
 
