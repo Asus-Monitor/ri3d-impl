@@ -257,6 +257,13 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
                            truncation=True, return_tensors="pt").input_ids.to(device)
         text_embeds = text_encoder(tokens)[0]
 
+        # Pre-compute empty text embedding for CFG dropout during training.
+        # Without this, the LoRA never sees the unconditional case, and CFG at
+        # inference creates unpredictable LoRA outputs that cause hallucinations.
+        empty_tokens = tokenizer("", padding="max_length", max_length=77,
+                                 truncation=True, return_tensors="pt").input_ids.to(device)
+        empty_embeds = text_encoder(empty_tokens)[0]
+
     if _owns_text_encoder and not _owns_components:
         del text_encoder
         torch.cuda.empty_cache()
@@ -305,9 +312,10 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
     # to hallucinate scene content (e.g., flowers) instead of removing artifacts.
     controlnet = ControlNetModel.from_pretrained(cfg.controlnet_model,
                                                   torch_dtype=dtype, use_safetensors=False).to(device)
+    lora_alpha = int(cfg.repair_lora_rank * cfg.repair_lora_alpha_mult)
     lora_config = LoraConfig(
         r=cfg.repair_lora_rank,
-        lora_alpha=cfg.repair_lora_rank,
+        lora_alpha=lora_alpha,  # >rank amplifies LoRA corrections over pretrained weights
         target_modules=[
             "to_q", "to_v", "to_k", "to_out.0",  # attention
             "conv1", "conv2",                       # resnet convolutions
@@ -326,7 +334,7 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
             "controlnet_cond_embedding.blocks.5",
             "controlnet_cond_embedding.conv_out",
         ],
-        lora_dropout=0.15,  # regularization: prevents overfitting to 24 LOO pairs
+        lora_dropout=cfg.repair_lora_dropout,
     )
     controlnet = get_peft_model(controlnet, lora_config)
     controlnet.print_trainable_parameters()
@@ -350,6 +358,13 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
         batch_size = 1
     n_steps = (n_iters + batch_size - 1) // batch_size
     text_embeds_b = text_embeds.expand(batch_size, -1, -1)
+    empty_embeds_b = empty_embeds.expand(batch_size, -1, -1)
+
+    # Cosine LR schedule: warm start → gradual decay. Helps convergence over
+    # fixed LR, especially with more training iterations.
+    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=n_steps, eta_min=cfg.repair_lr * 0.01,
+    )
 
     # GradScaler prevents fp16 gradient underflow. Without it, ~50% of LoRA
     # parameters get zero gradients and never learn (verified empirically).
@@ -398,14 +413,22 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
         noise_b = torch.cat(noises)
         t_b = torch.cat(ts)
 
+        # CFG dropout: randomly use empty text embedding so the LoRA learns
+        # how to behave in the unconditional case. Without this, CFG at
+        # inference amplifies undefined LoRA behavior → hallucination.
+        if random.random() < cfg.repair_cfg_dropout:
+            step_embeds = empty_embeds_b[:actual_bs]
+        else:
+            step_embeds = text_embeds_b[:actual_bs]
+
         controlnet_output = controlnet(
-            noisy_lat_b, t_b, encoder_hidden_states=text_embeds_b[:actual_bs],
+            noisy_lat_b, t_b, encoder_hidden_states=step_embeds,
             controlnet_cond=corrupted_b,
             return_dict=False,
         )
 
         noise_pred = unet(
-            noisy_lat_b, t_b, encoder_hidden_states=text_embeds_b[:actual_bs],
+            noisy_lat_b, t_b, encoder_hidden_states=step_embeds,
             down_block_additional_residuals=controlnet_output[0],
             mid_block_additional_residual=controlnet_output[1],
         ).sample
@@ -415,6 +438,7 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
         scaler.step(optimizer)
         scaler.update()
         optimizer.zero_grad(set_to_none=True)
+        lr_scheduler.step()
 
         iter_count += actual_bs
         losses.append(loss.item())
