@@ -24,7 +24,15 @@
       "Bash(xargs cat:*)",
       "Bash(echo \"EXIT: $?\")",
       "Bash(curl -s \"https://raw.githubusercontent.com/thuanz123/realfill/main/train_realfill.py\")",
-      "Bash(curl -s \"https://raw.githubusercontent.com/thuanz123/realfill/main/README.md\")"
+      "Bash(curl -s \"https://raw.githubusercontent.com/thuanz123/realfill/main/README.md\")",
+      "Bash(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader)",
+      "Bash(nvidia-smi)",
+      "Bash(PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python optimize_repair.py --scene ../dataset/bonsai --phase1_only --n_eval 6 --max_iters 100)",
+      "Bash(git checkout:*)",
+      "Bash(PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python run_pipeline.py --scene ../dataset/bonsai --optimize)",
+      "Bash(tee /home/vy/ri3d-impl/output/bonsai/optimize_run.log)",
+      "Bash(git log:*)",
+      "Bash(grep -E \"\\\\.py$|^d\")"
     ]
   }
 }
