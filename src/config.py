@@ -41,19 +41,19 @@ class RI3DConfig:
     gaussian_scale_factor: float = 1.4  # scale relative to pixel size
     gaussian_init_opacity: float = 0.1
 
-    # Repair model (ControlNet LoRA, DPM++ scheduler, txt2img pipeline)
+    # Repair model (ControlNet LoRA, DPM++ scheduler, img2img pipeline)
     sd_model: str = "stable-diffusion-v1-5/stable-diffusion-v1-5"
     controlnet_model: str = "lllyasviel/control_v11f1e_sd15_tile"
-    repair_train_iters: int = 3500 # more iters to let LoRA fully override pretrained tile behavior
+    repair_train_iters: int = 1800*5  # paper Sec 8.1: "fine-tune the repair model for 1800 iterations"
     repair_lr: float = 1e-4
-    repair_lora_rank: int = 128
+    repair_lora_rank: int = 48      # moderate rank: enough capacity for corruption→clean mapping without memorizing training pairs
     repair_lora_dropout: float = 0.05   # light regularization; 0.15 was too aggressive for ~50 pairs
-    repair_lora_alpha_mult: float = 1.5  # lora_alpha = rank * mult; >1 amplifies LoRA over pretrained weights
+    repair_lora_alpha_mult: float = 1.0  # standard: lora_alpha = rank; higher values over-amplify LoRA and cause hallucination
     repair_cfg_dropout: float = 0.1     # 10% chance of empty text embedding during training; teaches unconditional mode for better CFG at inference
-    repair_inference_steps: int = 40   # more steps for better quality (diminishing returns after 30)
+    repair_inference_steps: int = 20    # DPM++ is efficient at 20 steps; more steps = more drift from ControlNet guidance
     repair_guidance_scale: float = 1.0  # unconditional: text prompt OFF prevents SD1.5 generative prior from hallucinating objects
-    repair_controlnet_scale: float = 1.1  # >1.0: strong structural guidance; LoRA in cond_embedding filters artifacts at encoding stage; retrained model optimal at 1.1
-    repair_strength: float = 0.99         # near-full denoising: ControlNet (1.1 scale) carries all structural info; almost no original signal needed
+    repair_controlnet_scale: float = 1.0  # standard scale; >1.0 over-amplifies structural signal from corrupted input
+    repair_strength: float = 0.80         # moderate denoising: preserves 20% of original signal as safety net; with LoRA (not full fine-tune) lower strength reduces hallucination
     repair_positive_prompt: str = "best quality, sharp detail"
     repair_negative_prompt: str = "blur, lowres, bad quality, deformed"
 

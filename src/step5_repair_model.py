@@ -218,7 +218,10 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
         raise RuntimeError(f"No training pairs for {cfg.scene_name}. Run data generation first.")
     print(f"Training pairs for {cfg.scene_name}: {len(all_pairs)}")
 
-    # Use shared frozen components if provided, otherwise load our own
+    # ------------------------------------------------------------------
+    # Load frozen components. VAE and text_encoder are freed after
+    # pre-computation; only UNet stays on GPU for the training loop.
+    # ------------------------------------------------------------------
     _owns_components = shared_components is None
     if _owns_components:
         print("Loading SD 1.5 + ControlNet tile...")
@@ -240,9 +243,7 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
         unet = shared_components["unet"]
         noise_scheduler = shared_components["noise_scheduler"]
 
-    # Encode the SAME positive prompt used at inference (cfg.repair_positive_prompt).
-    # Training with empty "" but inferring with "best quality, sharp detail" creates
-    # a text-embedding mismatch that distorts the LoRA's learned corrections.
+    # Encode text embeddings, then free text encoder.
     if tokenizer is None or text_encoder is None:
         tokenizer = CLIPTokenizer.from_pretrained(cfg.sd_model, subfolder="tokenizer")
         text_encoder = CLIPTextModel.from_pretrained(cfg.sd_model, subfolder="text_encoder",
@@ -257,20 +258,19 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
                            truncation=True, return_tensors="pt").input_ids.to(device)
         text_embeds = text_encoder(tokens)[0]
 
-        # Pre-compute empty text embedding for CFG dropout during training.
-        # Without this, the LoRA never sees the unconditional case, and CFG at
-        # inference creates unpredictable LoRA outputs that cause hallucinations.
         empty_tokens = tokenizer("", padding="max_length", max_length=77,
                                  truncation=True, return_tensors="pt").input_ids.to(device)
         empty_embeds = text_encoder(empty_tokens)[0]
 
+    # Free text encoder — only needed for the two embeddings above
     if _owns_text_encoder and not _owns_components:
         del text_encoder
-        torch.cuda.empty_cache()
+    if _owns_components:
+        del text_encoder, tokenizer
+    torch.cuda.empty_cache()
 
     # ------------------------------------------------------------------
     # Pre-compute: resize pairs, move to GPU, pre-encode clean latents.
-    # Eliminates per-step VAE encode + CPU resize + CPU→GPU transfer.
     # ------------------------------------------------------------------
     torch.backends.cudnn.benchmark = True
     latent_crop = 64  # 512px // 8 (VAE downscale)
@@ -306,25 +306,22 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
     n_pairs = len(pair_corrupted_gpu)
     print(f"Pre-encoded {n_pairs} pairs on GPU")
 
-    # Fresh ControlNet + LoRA AND UNet + LoRA for this scene.
-    # Per GaussianObject [42] (which this paper follows): fine-tune BOTH networks.
-    # ControlNet LoRA alone can't override the UNet's generative prior, causing it
-    # to hallucinate scene content (e.g., flowers) instead of removing artifacts.
+    # Free VAE — only needed for the pre-encoding above
+    if _owns_components:
+        del vae
+    torch.cuda.empty_cache()
+
+    # Fresh ControlNet + LoRA for this scene.
     controlnet = ControlNetModel.from_pretrained(cfg.controlnet_model,
                                                   torch_dtype=dtype, use_safetensors=False).to(device)
     lora_alpha = int(cfg.repair_lora_rank * cfg.repair_lora_alpha_mult)
     lora_config = LoraConfig(
         r=cfg.repair_lora_rank,
-        lora_alpha=lora_alpha,  # >rank amplifies LoRA corrections over pretrained weights
+        lora_alpha=lora_alpha,
         target_modules=[
             "to_q", "to_v", "to_k", "to_out.0",  # attention
             "conv1", "conv2",                       # resnet convolutions
             "proj_in", "proj_out",                  # transformer projections
-            # CRITICAL: the conditioning embedding (8 Conv2d layers) is the very first
-            # thing that processes the corrupted image. Without LoRA here, it stays frozen
-            # as a tile-upscaling encoder and extracts wrong features from corrupted renders,
-            # causing the model to hallucinate scene content instead of cleaning artifacts.
-            # Listed individually to avoid matching the ModuleList/Sequential containers.
             "controlnet_cond_embedding.conv_in",
             "controlnet_cond_embedding.blocks.0",
             "controlnet_cond_embedding.blocks.1",
@@ -339,20 +336,20 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
     controlnet = get_peft_model(controlnet, lora_config)
     controlnet.print_trainable_parameters()
 
-    # UNet stays frozen — ControlNet LoRA (including conditioning embedding)
-    # provides enough capacity for repair. UNet LoRA would OOM on <8GB GPUs.
+    # UNet frozen + eval (no dropout/batchnorm training overhead)
     unet.requires_grad_(False)
+    unet.eval()
 
     optimizer = torch.optim.AdamW(controlnet.parameters(), lr=cfg.repair_lr, weight_decay=1e-2)
 
     n_iters = cfg.repair_train_iters
     max_t = noise_scheduler.config.num_train_timesteps
 
-    # Scale batch size to GPU memory
+    # Freed VAE+text_encoder (~400MB) enables batch_size=2 on <12GB GPUs.
     gpu_mem_gb = torch.cuda.get_device_properties(device).total_memory / (1024 ** 3)
     if gpu_mem_gb >= 20:
         batch_size = 4
-    elif gpu_mem_gb >= 12:
+    elif gpu_mem_gb >= 7:
         batch_size = 2
     else:
         batch_size = 1
@@ -360,14 +357,10 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
     text_embeds_b = text_embeds.expand(batch_size, -1, -1)
     empty_embeds_b = empty_embeds.expand(batch_size, -1, -1)
 
-    # Cosine LR schedule: warm start → gradual decay. Helps convergence over
-    # fixed LR, especially with more training iterations.
     lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=n_steps, eta_min=cfg.repair_lr * 0.01,
     )
 
-    # GradScaler prevents fp16 gradient underflow. Without it, ~50% of LoRA
-    # parameters get zero gradients and never learn (verified empirically).
     scaler = torch.amp.GradScaler("cuda")
 
     print(f"Training ControlNet LoRA for {n_iters} iterations (batch={batch_size}) "
@@ -402,8 +395,6 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
             noise = torch.randn_like(clean_lat)
             t = torch.randint(0, max_t, (1,), device=device).long()
 
-            # Standard training per paper: noise clean latent, predict epsilon.
-            # ControlNet condition (corrupted image) teaches the mapping.
             noisy_lats.append(noise_scheduler.add_noise(clean_lat, noise, t))
             noises.append(noise)
             ts.append(t)
@@ -414,13 +405,15 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
         t_b = torch.cat(ts)
 
         # CFG dropout: randomly use empty text embedding so the LoRA learns
-        # how to behave in the unconditional case. Without this, CFG at
-        # inference amplifies undefined LoRA behavior → hallucination.
+        # the unconditional case, preventing hallucination at inference.
         if random.random() < cfg.repair_cfg_dropout:
             step_embeds = empty_embeds_b[:actual_bs]
         else:
             step_embeds = text_embeds_b[:actual_bs]
 
+        # Standard ControlNet training: noise prediction through frozen UNet.
+        # The UNet backward provides the gradient signal that teaches the LoRA
+        # how corruption maps to clean output — this cannot be approximated.
         controlnet_output = controlnet(
             noisy_lat_b, t_b, encoder_hidden_states=step_embeds,
             controlnet_cond=corrupted_b,
@@ -448,7 +441,6 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
             print(f"  Step ~{min(iter_count, n_iters)}: loss = {avg_loss:.6f}")
 
     controlnet.save_pretrained(model_dir / "controlnet")
-    # Save a marker so inference knows there's no UNet LoRA
     (model_dir / "unet_frozen").touch()
     print(f"Saved repair model (ControlNet LoRA incl. cond_embedding) to {model_dir}")
 
@@ -462,7 +454,7 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
 
     del controlnet, optimizer, pair_corrupted_gpu, pair_clean_lat_gpu
     if _owns_components:
-        del text_encoder, vae, unet
+        del unet
     torch.cuda.empty_cache()
 
 
@@ -495,6 +487,9 @@ def test_repair_model(cfg: RI3DConfig):
     if n_test == 1:
         axes = axes.reshape(-1, 1)
 
+    print(f"{'Pair':>6}  {'Corrupted L1':>13}  {'Repaired L1':>12}  {'Improvement':>11}")
+    print("-" * 50)
+
     for j in range(n_test):
         idx = j * (len(pairs) // n_test)
         corrupted, clean = pairs[idx]
@@ -503,20 +498,26 @@ def test_repair_model(cfg: RI3DConfig):
         corrupted_tensor = corrupted.to(cfg.device)
         repaired_tensor = repair_image(pipe, corrupted_tensor, cfg, view_index=j)
 
-        H_orig, W_orig = corrupted.shape[:2]
+        # L1 losses (match resolution: repaired is already at corrupted's H,W)
+        clean_device = clean.to(cfg.device)
+        l1_corrupted = F.l1_loss(corrupted_tensor, clean_device).item()
+        l1_repaired = F.l1_loss(repaired_tensor, clean_device).item()
+        improvement = l1_corrupted - l1_repaired
+        print(f"{idx:>6}  {l1_corrupted:>13.4f}  {l1_repaired:>12.4f}  {improvement:>+11.4f}")
+
         result_np = repaired_tensor.cpu().numpy()
 
         axes[0, j].imshow(corrupted.numpy())
-        axes[0, j].set_title(f"Corrupted (pair {idx})")
+        axes[0, j].set_title(f"Corrupted (pair {idx})\nL1={l1_corrupted:.4f}")
         axes[0, j].axis("off")
         axes[1, j].imshow(result_np)
-        axes[1, j].set_title("Repaired")
+        axes[1, j].set_title(f"Repaired\nL1={l1_repaired:.4f} ({improvement:+.4f})")
         axes[1, j].axis("off")
         axes[2, j].imshow(clean.numpy())
         axes[2, j].set_title("Ground Truth")
         axes[2, j].axis("off")
 
-    fig.suptitle(f"Repair Test — {cfg.scene_name}")
+    fig.suptitle(f"Repair Test — {cfg.scene_name}", fontsize=14, y=1.01)
     fig.savefig(test_dir / "repair_test_results.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
 

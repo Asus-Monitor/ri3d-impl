@@ -32,7 +32,10 @@
       "Bash(PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python run_pipeline.py --scene ../dataset/bonsai --optimize)",
       "Bash(tee /home/vy/ri3d-impl/output/bonsai/optimize_run.log)",
       "Bash(git log:*)",
-      "Bash(grep -E \"\\\\.py$|^d\")"
+      "Bash(grep -E \"\\\\.py$|^d\")",
+      "Bash(du -sh /home/vy/.cache/huggingface/hub/models--*)",
+      "Bash(du -sh /home/vy/ri3d-impl/output/*/repair_training_data/)",
+      "Bash(du -sh /home/vy/ri3d-impl/output/*/)"
     ]
   }
 }
