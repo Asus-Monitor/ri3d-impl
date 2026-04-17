@@ -47,7 +47,7 @@ def generate_leave_one_out_data(cfg: RI3DConfig):
     fused_depth = torch.load(out_dir / "fused_depths" / "fused_depth_000.pt", weights_only=True)
     H, W = fused_depth.shape
 
-    # Load GT at DUSt3R resolution (for 3DGS training and repair pairs)
+    
     gt_images_render = []
     for ip in image_paths:
         img = Image.open(ip).convert("RGB")
@@ -57,17 +57,17 @@ def generate_leave_one_out_data(cfg: RI3DConfig):
 
     all_pairs = []
 
-    # Pre-compute w2c matrices and move everything to GPU once
+    
     w2c_all = torch.linalg.inv(poses).to(device)
     K_all = intrinsics.to(device)
 
     s = cfg.loo_render_scale
     loo_H, loo_W = int(H * s), int(W * s)
     loo_K_all = K_all.clone()
-    loo_K_all[:, 0, :] *= s  # scale fx, cx
-    loo_K_all[:, 1, :] *= s  # scale fy, cy
+    loo_K_all[:, 0, :] *= s  
+    loo_K_all[:, 1, :] *= s  
 
-    # GT images at LOO resolution for training loss (on GPU)
+    
     gt_gpu_loo = []
     for g in gt_images_render:
         g_loo = F.interpolate(
@@ -78,18 +78,18 @@ def generate_leave_one_out_data(cfg: RI3DConfig):
 
     torch.backends.cudnn.benchmark = True
 
-    # Per paper Sec 8.1: training pairs come from phase 2 (after re-adding the
-    # left-out view at iteration 6000, continuing to 10000). Snapshots capture
-    # progressively refined corruption as the model re-learns the left-out view.
+    
+    
+    
     snapshot_steps = set(
         range(cfg.loo_initial_iters, cfg.loo_total_iters, cfg.loo_snapshot_interval)
     )
 
     all_indices = list(range(n_images))
 
-    # Compute per-view Gaussian counts for LOO initialization filtering.
-    # Paper Sec 4.2: "We then optimize N separate 3DGS representations on these
-    # subsets" — each LOO model should be initialized with only N-1 views' Gaussians.
+    
+    
+    
     per_view_counts = []
     for i in range(n_images):
         fd = torch.load(out_dir / "fused_depths" / f"fused_depth_{i:03d}.pt", weights_only=True)
@@ -106,7 +106,7 @@ def generate_leave_one_out_data(cfg: RI3DConfig):
         train_indices = [j for j in range(n_images) if j != left_out_idx]
         clean_cpu = gt_images_render[left_out_idx]
 
-        # Filter init_gaussians to exclude left-out view (paper Sec 4.2)
+        
         lo_start = per_view_offsets[left_out_idx]
         lo_end = per_view_offsets[left_out_idx + 1]
         loo_gaussians = {
@@ -123,14 +123,14 @@ def generate_leave_one_out_data(cfg: RI3DConfig):
         K_lo = K_all[left_out_idx]
 
         for step in tqdm(range(cfg.loo_total_iters), desc=f"  LOO {left_out_idx}"):
-            # Phase 1: train without left-out view; Phase 2: all views
+            
             if step < cfg.loo_initial_iters:
                 idx = train_indices[step % len(train_indices)]
             else:
                 idx = all_indices[step % n_images]
 
-            # L1-only training — the purpose is to generate corruption patterns,
-            # not achieve best 3DGS quality
+            
+            
             result = model.render_for_optim(
                 w2c_all[idx], loo_K_all[idx], loo_H, loo_W,
                 strategy, strategy_state, step,
@@ -141,8 +141,8 @@ def generate_leave_one_out_data(cfg: RI3DConfig):
             model.step_post_backward(step, result["meta"])
             model.optimizer_step()
 
-            # Snapshot during phase 2 (after re-adding left-out view)
-            # Full resolution — these become the actual repair training pairs
+            
+            
             if step in snapshot_steps:
                 with torch.no_grad():
                     r = model.render(w2c_lo, K_lo, H, W)
@@ -155,7 +155,7 @@ def generate_leave_one_out_data(cfg: RI3DConfig):
     print(f"\nGenerated {len(all_pairs)} training pairs for scene {cfg.scene_name}")
     torch.save(all_pairs, data_dir / "training_pairs.pt")
 
-    # Save visual preview — sample evenly across all pairs to show different views
+    
     n_show = min(8, len(all_pairs))
     if n_show > 0:
         preview_indices = [int(i * len(all_pairs) / n_show) for i in range(n_show)]
@@ -186,11 +186,11 @@ def generate_all_scenes_data(cfg: RI3DConfig):
             output_dir=cfg.output_dir, n_views=cfg.n_views,
             device=cfg.device, dtype=cfg.dtype,
         )
-        # Check if steps 1-4 outputs exist
+        
         if not (scene_cfg.scene_output_dir() / "init_gaussians.pt").exists():
             print(f"  Skipping {scene_dir.name}: run steps 1-4 first")
             continue
-        # Check if already generated
+        
         if (scene_cfg.scene_output_dir() / "repair_training_data" / "training_pairs.pt").exists():
             print(f"  Skipping {scene_dir.name}: training pairs already exist")
             continue
@@ -223,17 +223,17 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
     device = cfg.device
     dtype = cfg.dtype
 
-    # Load this scene's training pairs
+    
     pairs_path = cfg.scene_output_dir() / "repair_training_data" / "training_pairs.pt"
     all_pairs = torch.load(pairs_path, weights_only=False)
     if len(all_pairs) == 0:
         raise RuntimeError(f"No training pairs for {cfg.scene_name}. Run data generation first.")
     print(f"Training pairs for {cfg.scene_name}: {len(all_pairs)}")
 
-    # ------------------------------------------------------------------
-    # Load frozen components. VAE and text_encoder are freed after
-    # pre-computation; only UNet stays on GPU for the training loop.
-    # ------------------------------------------------------------------
+    
+    
+    
+    
     _owns_components = shared_components is None
     if _owns_components:
         print("Loading SD 1.5 + ControlNet tile...")
@@ -255,7 +255,7 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
         unet = shared_components["unet"]
         noise_scheduler = shared_components["noise_scheduler"]
 
-    # Encode text embeddings, then free text encoder.
+    
     if tokenizer is None or text_encoder is None:
         tokenizer = CLIPTokenizer.from_pretrained(cfg.sd_model, subfolder="tokenizer")
         text_encoder = CLIPTextModel.from_pretrained(cfg.sd_model, subfolder="text_encoder",
@@ -270,20 +270,20 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
                            truncation=True, return_tensors="pt").input_ids.to(device)
         text_embeds = text_encoder(tokens)[0]
 
-    # Free text encoder — only needed for the two embeddings above
+    
     if _owns_text_encoder and not _owns_components:
         del text_encoder
     if _owns_components:
         del text_encoder, tokenizer
     torch.cuda.empty_cache()
 
-    # ------------------------------------------------------------------
-    # Pre-compute: resize pairs, move to GPU, pre-encode clean latents.
-    # ------------------------------------------------------------------
+    
+    
+    
     torch.backends.cudnn.benchmark = True
-    latent_crop = 64  # 512px // 8 (VAE downscale)
-    pair_corrupted_gpu = []   # (3, H, W) on GPU, dims rounded to 8
-    pair_clean_lat_gpu = []   # (4, H//8, W//8) pre-encoded latents
+    latent_crop = 64  
+    pair_corrupted_gpu = []   
+    pair_clean_lat_gpu = []   
 
     with torch.no_grad():
         for corrupted, clean in all_pairs:
@@ -314,12 +314,12 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
     n_pairs = len(pair_corrupted_gpu)
     print(f"Pre-encoded {n_pairs} pairs on GPU")
 
-    # Free VAE — only needed for the pre-encoding above
+    
     if _owns_components:
         del vae
     torch.cuda.empty_cache()
 
-    # Fresh ControlNet + LoRA for this scene.
+    
     controlnet = ControlNetModel.from_pretrained(cfg.controlnet_model,
                                                   torch_dtype=dtype, use_safetensors=False).to(device)
     lora_alpha = int(cfg.repair_lora_rank * cfg.repair_lora_alpha_mult)
@@ -327,9 +327,9 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
         r=cfg.repair_lora_rank,
         lora_alpha=lora_alpha,
         target_modules=[
-            "to_q", "to_v", "to_k", "to_out.0",  # attention
-            "conv1", "conv2",                       # resnet convolutions
-            "proj_in", "proj_out",                  # transformer projections
+            "to_q", "to_v", "to_k", "to_out.0",  
+            "conv1", "conv2",                       
+            "proj_in", "proj_out",                  
             "controlnet_cond_embedding.conv_in",
             "controlnet_cond_embedding.blocks.0",
             "controlnet_cond_embedding.blocks.1",
@@ -344,7 +344,7 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
     controlnet = get_peft_model(controlnet, lora_config)
     controlnet.print_trainable_parameters()
 
-    # UNet frozen + eval (no dropout/batchnorm training overhead)
+    
     unet.requires_grad_(False)
     unet.eval()
 
@@ -353,7 +353,7 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
     n_iters = cfg.repair_train_iters
     max_t = noise_scheduler.config.num_train_timesteps
 
-    # Freed VAE+text_encoder (~400MB) enables batch_size=2 on <12GB GPUs.
+    
     gpu_mem_gb = torch.cuda.get_device_properties(device).total_memory / (1024 ** 3)
     if gpu_mem_gb >= 20:
         batch_size = 4
@@ -391,7 +391,7 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
             cl_full = pair_clean_lat_gpu[idx]
             _, h, w = c_full.shape
 
-            # Random crop aligned to 8px for exact latent correspondence
+            
             x0 = random.randint(0, max(0, (w - 512) // 8)) * 8
             y0 = random.randint(0, max(0, (h - 512) // 8)) * 8
             lx, ly = x0 // 8, y0 // 8
@@ -426,7 +426,7 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
                 mid_block_additional_residual=controlnet_output[1],
             ).sample
 
-        # Standard diffusion loss (MSE between predicted and actual noise)
+        
         loss = F.mse_loss(noise_pred.float(), noise_b.float())
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -497,11 +497,11 @@ def test_repair_model(cfg: RI3DConfig):
         idx = j * (len(pairs) // n_test)
         corrupted, clean = pairs[idx]
 
-        # Use repair_image — same function called during optimization
+        
         corrupted_tensor = corrupted.to(cfg.device)
         repaired_tensor = repair_image(pipe, corrupted_tensor, cfg, view_index=j)
 
-        # L1 losses (match resolution: repaired is already at corrupted's H,W)
+        
         clean_device = clean.to(cfg.device)
         l1_corrupted = F.l1_loss(corrupted_tensor, clean_device).item()
         l1_repaired = F.l1_loss(repaired_tensor, clean_device).item()

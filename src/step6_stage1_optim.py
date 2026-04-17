@@ -53,7 +53,7 @@ def load_repair_pipeline(cfg: RI3DConfig):
     dtype = cfg.dtype
     device = cfg.device
 
-    # Load ControlNet + scene LoRA (includes conditioning embedding LoRA)
+    
     controlnet_lora_dir = model_dir / "controlnet"
     controlnet = ControlNetModel.from_pretrained(cfg.controlnet_model, torch_dtype=dtype, use_safetensors=False)
     controlnet = PeftModel.from_pretrained(controlnet, controlnet_lora_dir)
@@ -94,10 +94,10 @@ def repair_image(pipe, image_tensor: torch.Tensor, cfg: RI3DConfig,
     img_pil = Image.fromarray(img_np)
     img_resized, pipe_h, pipe_w = _prepare_for_pipeline(img_pil)
 
-    # Fixed seed per view: same view always gets same noise trajectory.
-    # The output still changes across refresh cycles (because the rendered
-    # input changes), but the stochastic component is fixed — so changes
-    # in pseudo GT come only from actual Gaussian improvement, not noise.
+    
+    
+    
+    
     generator = torch.Generator(device=cfg.device).manual_seed(42 + view_index)
 
     strength = strength_override if strength_override is not None else cfg.repair_strength
@@ -126,11 +126,11 @@ def compute_camera_distance_weight(novel_c2w: torch.Tensor,
     Cameras closer to input cameras get higher weight.
     """
     novel_pos = novel_c2w[:3, 3]
-    input_pos = input_c2ws[:, :3, 3]  # (N, 3)
-    dists = (input_pos - novel_pos.unsqueeze(0)).norm(dim=-1)  # (N,)
+    input_pos = input_c2ws[:, :3, 3]  
+    dists = (input_pos - novel_pos.unsqueeze(0)).norm(dim=-1)  
     min_dist = dists.min()
 
-    # Exponential decay weight
+    
     weight = torch.exp(-min_dist / (dists.mean() + 1e-8))
     return weight.clamp(0.1, 1.0)
 
@@ -153,23 +153,23 @@ def run_stage1(cfg: RI3DConfig):
 
     device = cfg.device
 
-    # Load scene data
+    
     image_paths = cfg.load_image_paths()
     poses = torch.load(out_dir / "dust3r_poses.pt", weights_only=True).float().to(device)
     intrinsics = torch.load(out_dir / "dust3r_intrinsics.pt", weights_only=True).float().to(device)
     gaussians_init = torch.load(out_dir / "init_gaussians.pt", weights_only=True)
     n_images = len(image_paths)
 
-    # Get render resolution
+    
     fused_depth_0 = torch.load(out_dir / "fused_depths" / "fused_depth_000.pt", weights_only=True)
     H, W = fused_depth_0.shape
 
-    # Load GT images and mono depths (shared utility, avoids duplication with step8)
+    
     from utils import load_gt_images, load_mono_depths
     gt_images = load_gt_images(image_paths, H, W, device)
     mono_depths = load_mono_depths(out_dir, n_images, device)
 
-    # Initialize model
+    
     model = GaussianModel(gaussians_init, device)
     optimizers = model.setup_optimizers(cfg)
 
@@ -178,47 +178,47 @@ def run_stage1(cfg: RI3DConfig):
     print(f"  Scene scale: {scene_scale:.4f}")
     strategy, strategy_state = model.setup_strategy(cfg, scene_scale=scene_scale)
 
-    # Loss functions
+    
     ssim_fn = SSIMLoss().to(device)
     lpips_fn = LPIPSLoss(device)
 
-    # Generate novel cameras (scene center from camera look-at points, robust to outliers)
+    
     from step4_gaussian_init import compute_scene_center
     scene_center = compute_scene_center(poses, gaussians_init["means"].to(device))
-    # Stage 1: restrict novel cameras to input angular range (paper: "aligned with input cameras").
-    # Cameras outside the input range see only garbage — repair model can't fix that.
+    
+    
     novel_c2w = generate_elliptical_cameras(
         poses, cfg.stage1_num_novel_views, scene_center,
         restrict_to_inputs=True, margin_deg=20.0,
     ).to(device)
     K_avg = intrinsics.mean(dim=0)
 
-    # Precompute w2c matrices (avoids repeated torch.linalg.inv per step)
-    input_w2c = torch.linalg.inv(poses)       # (N, 4, 4)
-    novel_w2c = torch.linalg.inv(novel_c2w)   # (M, 4, 4)
+    
+    input_w2c = torch.linalg.inv(poses)       
+    novel_w2c = torch.linalg.inv(novel_c2w)   
 
-    # Load repair pipeline
+    
     print("Loading repair model for Stage 1...")
     repair_pipe = load_repair_pipeline(cfg)
 
-    # Initialize pseudo ground truth for novel views
+    
     pseudo_gt = [None] * cfg.stage1_num_novel_views
     camera_weights = torch.zeros(cfg.stage1_num_novel_views, device=device)
     for j in range(cfg.stage1_num_novel_views):
         camera_weights[j] = compute_camera_distance_weight(novel_c2w[j], poses)
 
-    # Plateau detector
+    
     plateau = PlateauDetector(cfg.plateau_window, cfg.plateau_threshold, cfg.plateau_min_iters)
     losses_history = []
 
-    # Cached background masks (recomputed at refresh intervals, not every step)
+    
     cached_bg_masks = [None] * cfg.stage1_num_novel_views
 
-    # Adaptive repair strength: high at start (heavy corruption needs the model
-    # to override more of the input) → low at end (light corruption, preserve structure).
-    # The ControlNet conditioning provides structural safety even at high strength.
-    s_max = cfg.repair_strength_max  # 0.75 — heavy corruption
-    s_min = cfg.repair_strength_min  # 0.35 — light corruption
+    
+    
+    
+    s_max = cfg.repair_strength_max  
+    s_min = cfg.repair_strength_min  
 
     print(f"\n=== Stage 1 Optimization ===")
     print(f"Input views: {n_images}, Novel views: {cfg.stage1_num_novel_views}")
@@ -228,9 +228,9 @@ def run_stage1(cfg: RI3DConfig):
 
     for step in tqdm(range(cfg.stage1_max_iters), desc="Stage 1"):
 
-        # Refresh pseudo ground truth periodically
+        
         if step % cfg.stage1_refresh_interval == 0:
-            # Adaptive strength: linear interpolation from s_max → s_min over optimization
+            
             progress = step / max(cfg.stage1_max_iters - 1, 1)
             cur_strength = s_max + (s_min - s_max) * progress
             print(f"\n  Refreshing pseudo GT at step {step} (strength={cur_strength:.3f})...")
@@ -240,16 +240,16 @@ def run_stage1(cfg: RI3DConfig):
                     repaired = repair_image(repair_pipe, r["image"], cfg, view_index=j,
                                             strength_override=cur_strength)
                     pseudo_gt[j] = repaired.clamp(0, 1).detach()
-                    # Background mask from monocular depth of REPAIRED image (paper Sec 4.3):
-                    # "We obtain this background mask by applying agglomerative clustering
-                    #  on the monocular depth estimated for repaired images."
+                    
+                    
+                    
                     from utils import estimate_mono_depth
                     mono_d = estimate_mono_depth(repaired, cfg)
                     cached_bg_masks[j] = get_background_mask(
                         mono_d, cfg
                     ).to(device)
 
-                    # Save example renders (reuse already-rendered data, no extra render)
+                    
                     if j < 3:
                         fig, axes = plt.subplots(1, 3, figsize=(15, 5))
                         axes[0].imshow(r["image"].clamp(0,1).cpu().numpy())
@@ -263,7 +263,7 @@ def run_stage1(cfg: RI3DConfig):
                                     dpi=120, bbox_inches="tight")
                         plt.close(fig)
 
-        # --- Input view loss (with densification hooks) ---
+        
         ref_idx = step % n_images
         w2c_ref = input_w2c[ref_idx]
         K_ref = intrinsics[ref_idx]
@@ -276,31 +276,31 @@ def run_stage1(cfg: RI3DConfig):
         ref_loss = reconstruction_loss(result_ref["image"], gt_images[ref_idx],
                                         ssim_fn, lpips_fn_or_none, cfg)
 
-        # Depth correlation loss
+        
         d_corr = depth_correlation_loss(result_ref["depth"], mono_depths[ref_idx])
         ref_loss = ref_loss + cfg.loss_depth_corr_weight * d_corr
 
-        # Backward input view (frees its render graph; gradients accumulate)
+        
         ref_loss.backward()
         model.step_post_backward(step, result_ref["meta"])
         loss_val = ref_loss.item()
 
-        # --- Novel view losses (WITHOUT densification hooks) ---
-        # Per paper Eq. 3: sum over ALL M novel views each step.
-        # Backward per view to avoid OOM from holding all M render graphs.
+        
+        
+        
         if pseudo_gt[0] is not None:
             for nov_idx in range(cfg.stage1_num_novel_views):
                 w2c_nov = novel_w2c[nov_idx]
 
                 result_nov = model.render_for_loss(w2c_nov, K_avg, H, W, render_mode="RGB")
 
-                # Opacity mask: only enforce loss in visible regions (M_α)
-                alpha_mask = get_opacity_mask(result_nov["alpha"])  # (H, W)
+                
+                alpha_mask = get_opacity_mask(result_nov["alpha"])  
                 lambda_j = camera_weights[nov_idx]
 
-                # Term 2: λ_j * M_α * L_rec (paper Eq. 3)
-                # Divide by n_images (not M) to preserve the paper's novel-to-input
-                # ratio when using 1 input view per step instead of summing all N.
+                
+                
+                
                 nov_loss = reconstruction_loss(
                     result_nov["image"], pseudo_gt[nov_idx],
                     ssim_fn, lpips_fn_or_none, cfg,
@@ -308,7 +308,7 @@ def run_stage1(cfg: RI3DConfig):
                 )
                 view_loss = (lambda_j / n_images) * nov_loss
 
-                # Term 3: ||A ⊙ (1 - M_α) ⊙ M_b||₁
+                
                 bg_mask = cached_bg_masks[nov_idx]
                 if bg_mask is not None:
                     opacity_reg = (
@@ -319,7 +319,7 @@ def run_stage1(cfg: RI3DConfig):
                 view_loss.backward()
                 loss_val += view_loss.item()
 
-        # All gradients accumulated — step optimizers
+        
         model.optimizer_step()
         losses_history.append(loss_val)
 
@@ -327,12 +327,12 @@ def run_stage1(cfg: RI3DConfig):
             print(f"  Step {step+1}: loss = {loss_val:.6f}, "
                   f"n_gaussians = {model.n_gaussians}")
 
-        # Plateau detection
+        
         if plateau.update(loss_val):
             print(f"\n  Plateau detected at step {step+1}, stopping Stage 1.")
             break
 
-    # Save checkpoint
+    
     checkpoint = {
         "gaussians": model.state_dict(),
         "step": step + 1,
@@ -342,7 +342,7 @@ def run_stage1(cfg: RI3DConfig):
     torch.save(checkpoint, ckpt_path)
     print(f"Saved Stage 1 checkpoint to {ckpt_path}")
 
-    # Save loss curve
+    
     fig, ax = plt.subplots(figsize=(10, 4))
     ax.plot(losses_history)
     ax.set_xlabel("Step")
@@ -351,7 +351,7 @@ def run_stage1(cfg: RI3DConfig):
     fig.savefig(out_dir / "stage1_loss.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
 
-    # Final renders from all input + novel views
+    
     print("Rendering final Stage 1 views...")
     with torch.no_grad():
         for i in range(n_images):
@@ -367,7 +367,7 @@ def run_stage1(cfg: RI3DConfig):
             plt.imsave(render_dir / f"final_novel_{j:03d}.png", img)
             plt.imsave(render_dir / f"final_novel_{j:03d}_alpha.png", alpha, cmap="gray")
 
-    # Cleanup
+    
     del repair_pipe, model
     torch.cuda.empty_cache()
 

@@ -87,12 +87,12 @@ def train_inpainting_model(cfg: RI3DConfig, shared_components=None):
     dtype = cfg.dtype
     inpaint_model_id = "runwayml/stable-diffusion-inpainting"
 
-    # Collect this scene's images
+    
     scene_images = collect_scene_images(cfg)
     if len(scene_images) == 0:
         raise RuntimeError(f"No images for {cfg.scene_name}. Run steps 1-4 first.")
 
-    # Use shared frozen components if provided, otherwise load our own
+    
     _owns_components = shared_components is None
     if _owns_components:
         print("Loading SD 1.5 inpainting model...")
@@ -108,7 +108,7 @@ def train_inpainting_model(cfg: RI3DConfig, shared_components=None):
             tokens = tokenizer("", padding="max_length", max_length=77,
                                return_tensors="pt").input_ids.to(device)
             text_embeds = text_encoder(tokens)[0]
-        # Free text encoder — only the cached embeddings are needed for training
+        
         del text_encoder, tokenizer
         torch.cuda.empty_cache()
     else:
@@ -116,20 +116,20 @@ def train_inpainting_model(cfg: RI3DConfig, shared_components=None):
         text_embeds = shared_components["text_embeds"]
         noise_scheduler = shared_components["noise_scheduler"]
 
-    # ------------------------------------------------------------------
-    # Pre-compute: cache images on GPU, pre-encode clean latents through VAE.
-    # Also pre-compute horizontally flipped versions to double effective data.
-    # Crops are 8px-aligned so clean_latent can be cropped in latent space
-    # (eliminates 1 of 2 VAE encodes per step). Masked image still needs
-    # per-step VAE encode since the mask changes each step.
-    # ------------------------------------------------------------------
+    
+    
+    
+    
+    
+    
+    
     torch.backends.cudnn.benchmark = True
     vae.eval()
-    latent_crop = 64  # 512px // 8
+    latent_crop = 64  
     scale = vae.config.scaling_factor
 
-    img_tensors_gpu = []    # (3, H, W) on GPU, dims rounded to 8
-    clean_latents_gpu = []  # (4, H//8, W//8) pre-encoded
+    img_tensors_gpu = []    
+    clean_latents_gpu = []  
 
     with torch.no_grad():
         for img_pil in scene_images:
@@ -143,8 +143,8 @@ def train_inpainting_model(cfg: RI3DConfig, shared_components=None):
             lat = vae.encode(img_t.unsqueeze(0) * 2 - 1).latent_dist.sample() * scale
             clean_latents_gpu.append(lat.squeeze(0))
 
-        # Horizontal flip augmentation — doubles effective training data.
-        # Must encode flipped images through VAE separately (conv is not flip-equivariant).
+        
+        
         n_orig = len(img_tensors_gpu)
         for i in range(n_orig):
             img_flip = img_tensors_gpu[i].flip(-1)
@@ -155,18 +155,18 @@ def train_inpainting_model(cfg: RI3DConfig, shared_components=None):
     n_images = len(img_tensors_gpu)
     print(f"  {n_orig} originals + {n_orig} flips = {n_images} effective training images")
 
-    # Fresh UNet + LoRA for this scene
-    # Paper uses full fine-tune; LoRA with attention + conv layers approximates it.
-    # Conv layers are critical — they handle texture synthesis (the "how things look"),
-    # while attention handles layout/semantics (the "what goes where").
+    
+    
+    
+    
     unet = UNet2DConditionModel.from_pretrained(inpaint_model_id, subfolder="unet",
                                                  torch_dtype=dtype).to(device)
     lora_config = LoraConfig(
         r=cfg.inpainting_lora_rank,
-        lora_alpha=2 * cfg.inpainting_lora_rank,  # alpha = 2*rank for stronger personalization
+        lora_alpha=2 * cfg.inpainting_lora_rank,  
         target_modules=[
-            "to_q", "to_v", "to_k", "to_out.0",  # attention: semantics + layout
-            "conv1", "conv2",                       # resnet convolutions: texture synthesis
+            "to_q", "to_v", "to_k", "to_out.0",  
+            "conv1", "conv2",                       
         ],
         lora_dropout=0.05,
     )
@@ -178,7 +178,7 @@ def train_inpainting_model(cfg: RI3DConfig, shared_components=None):
     n_iters = cfg.inpainting_train_iters
     max_t = noise_scheduler.config.num_train_timesteps
 
-    # Auto-scale batch size to GPU memory
+    
     gpu_mem_gb = torch.cuda.get_device_properties(device).total_memory / (1024 ** 3)
     if gpu_mem_gb >= 20:
         batch_size = 4
@@ -189,8 +189,8 @@ def train_inpainting_model(cfg: RI3DConfig, shared_components=None):
     n_steps = (n_iters + batch_size - 1) // batch_size
     text_embeds_b = text_embeds.expand(batch_size, -1, -1)
 
-    # GradScaler prevents fp16 gradient underflow. Without it, LoRA parameters
-    # get zero gradients and never learn (same issue as repair model training).
+    
+    
     scaler = torch.amp.GradScaler("cuda")
 
     print(f"Training inpainting LoRA for {n_iters} iterations (batch={batch_size}) "
@@ -215,16 +215,16 @@ def train_inpainting_model(cfg: RI3DConfig, shared_components=None):
             full_lat = clean_latents_gpu[idx]
             _, h, w = img_t.shape
 
-            # 8px-aligned crop for exact latent correspondence
+            
             x0 = random.randint(0, max(0, (w - 512) // 8)) * 8
             y0 = random.randint(0, max(0, (h - 512) // 8)) * 8
             lx, ly = x0 // 8, y0 // 8
             crop = img_t[:, y0:y0+512, x0:x0+512].unsqueeze(0)
 
-            # Clean latent from pre-encoded — no VAE encode needed
+            
             clean_lat = full_lat[:, ly:ly+latent_crop, lx:lx+latent_crop].unsqueeze(0)
 
-            # Random mask on GPU
+            
             mask = torch.zeros(1, 1, 512, 512, device=device, dtype=dtype)
             for _r in range(random.randint(1, 4)):
                 rh = int(512 * random.uniform(0.1, 0.8))
@@ -245,7 +245,7 @@ def train_inpainting_model(cfg: RI3DConfig, shared_components=None):
         noise_b = torch.cat(noises)
         t_b = torch.cat(ts)
 
-        # Only VAE encode needed: masked images (mask changes each step)
+        
         with torch.no_grad():
             masked_lat_b = vae.encode(masked_img_b * 2 - 1).latent_dist.sample() * scale
 
@@ -317,7 +317,7 @@ def test_inpainting_model(cfg: RI3DConfig):
     image_paths = cfg.load_image_paths()
     n_images = len(image_paths)
 
-    # Test each image with 3 different mask configurations (varied positions + sizes)
+    
     masks_per_image = 3
     total_cols = n_images * masks_per_image
     fig, axes = plt.subplots(3, total_cols, figsize=(5 * total_cols, 15))
@@ -325,9 +325,9 @@ def test_inpainting_model(cfg: RI3DConfig):
         axes = axes.reshape(-1, 1)
 
     mask_configs = [
-        (0.10, 0.25),  # small masks
-        (0.20, 0.40),  # medium masks
-        (0.35, 0.60),  # large masks
+        (0.10, 0.25),  
+        (0.20, 0.40),  
+        (0.35, 0.60),  
     ]
 
     from utils import prepare_for_pipeline
