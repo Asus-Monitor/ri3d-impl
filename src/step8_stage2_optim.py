@@ -292,10 +292,16 @@ def run_stage2(cfg: RI3DConfig):
     plateau = PlateauDetector(cfg.plateau_window, cfg.plateau_threshold, cfg.plateau_min_iters)
     losses_history = []
 
+    # Stage 2 repair strength: moderate start (Scene is already partly reconstructed
+    # from Stage 1), decreasing to light.  Uses the config's repair_strength as midpoint.
+    s2_max = cfg.repair_strength  # 0.55 — moderate corruption (post Stage 1)
+    s2_min = cfg.repair_strength_min  # 0.35 — light corruption (late Stage 2)
+
     print(f"\n=== Stage 2 Optimization ===")
     print(f"Max iters: {cfg.stage2_max_iters}")
     print(f"Novel views: {cfg.stage2_num_novel_views}, Inpaint views: {cfg.stage2_num_inpaint_views}")
     print(f"Inpaint interval: {cfg.stage2_inpaint_interval}, cutoff: {cfg.stage2_inpaint_cutoff}")
+    print(f"Repair strength: {s2_max:.2f} → {s2_min:.2f} (adaptive)")
 
     for step in tqdm(range(cfg.stage2_max_iters), desc="Stage 2"):
 
@@ -388,12 +394,18 @@ def run_stage2(cfg: RI3DConfig):
                     print("  Loading repair pipeline...")
                     repair_pipe = load_repair_pipeline(cfg)
 
+                # Adaptive strength for Stage 2
+                progress = step / max(cfg.stage2_max_iters - 1, 1)
+                cur_strength = s2_max + (s2_min - s2_max) * progress
+
                 for j in range(cfg.stage2_num_novel_views):
                     rc = renders_cache[j]
                     if inpainted_images[j] is not None:
-                        repaired = repair_image(repair_pipe, inpainted_images[j], cfg, view_index=j)
+                        repaired = repair_image(repair_pipe, inpainted_images[j], cfg,
+                                                view_index=j, strength_override=cur_strength)
                     else:
-                        repaired = repair_image(repair_pipe, rc["image"], cfg, view_index=j)
+                        repaired = repair_image(repair_pipe, rc["image"], cfg,
+                                                view_index=j, strength_override=cur_strength)
                     pseudo_gt[j] = repaired.clamp(0, 1).detach()
 
                     # Background mask from mono depth of REPAIRED image (paper Sec 4.3):
@@ -459,15 +471,15 @@ def run_stage2(cfg: RI3DConfig):
                 lambda_j = camera_weights[nov_idx]
 
                 # Term 2: λ_j * L_rec — NO visibility mask (key difference from Stage 1)
-                # Normalize by M so total novel contribution ≈ single-view magnitude.
-                M = cfg.stage2_num_novel_views
-                view_loss = (lambda_j / M) * reconstruction_loss(
+                # Divide by n_images (not M) to preserve paper's novel-to-input ratio.
+                view_loss = (lambda_j / n_images) * reconstruction_loss(
                     result_nov["image"], pseudo_gt[nov_idx],
                     ssim_fn, lpips_fn_or_none, cfg,
                 )
 
                 # Term 3: (1-M_α) ⊙ M_b ⊙ Lp(rendered, inpainted) — per paper Eq. 4.
-                # Uses L1 (pixel-level) loss for tight anchoring of inpainted content.
+                # L_p = L1 + LPIPS (perceptual) for texture-faithful anchoring.
+                # Both are computed as spatial maps and masked element-wise per paper.
                 # NOT divided by M — paper applies this per-view without normalization.
                 if inpainted_images[nov_idx] is not None and cached_bg_masks[nov_idx] is not None:
                     alpha_mask_now = get_opacity_mask(result_nov["alpha"])
@@ -477,7 +489,20 @@ def run_stage2(cfg: RI3DConfig):
                         n_ip_pixels = mask_ip.sum().clamp(min=1)
                         # L1 loss in inpainted regions
                         ip_l1 = ((result_nov["image"] - inpainted_images[nov_idx]).abs() * mask_ip_3ch).sum() / (n_ip_pixels * 3)
-                        view_loss = view_loss + cfg.loss_l1_weight * ip_l1
+                        ip_loss = cfg.loss_l1_weight * ip_l1
+                        # LPIPS (perceptual) loss in inpainted regions — paper's L_p
+                        # matches texture quality better than L1 alone
+                        if lpips_fn_or_none is not None:
+                            lpips_map = lpips_fn(result_nov["image"], inpainted_images[nov_idx],
+                                                 return_map=True)  # (H, W)
+                            if lpips_map.shape != mask_ip.shape:
+                                lpips_map = F.interpolate(
+                                    lpips_map.unsqueeze(0).unsqueeze(0),
+                                    size=mask_ip.shape, mode="bilinear", align_corners=False,
+                                ).squeeze()
+                            ip_lpips = (lpips_map * mask_ip).sum() / n_ip_pixels
+                            ip_loss = ip_loss + cfg.loss_lpips_weight * ip_lpips
+                        view_loss = view_loss + ip_loss
 
                 view_loss.backward()
                 loss_val += view_loss.item()

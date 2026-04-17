@@ -61,8 +61,6 @@ def generate_leave_one_out_data(cfg: RI3DConfig):
     w2c_all = torch.linalg.inv(poses).to(device)
     K_all = intrinsics.to(device)
 
-    # Downscaled resolution for LOO training — rasterization cost scales with pixel count.
-    # Snapshots still render at full res for quality pairs.
     s = cfg.loo_render_scale
     loo_H, loo_W = int(H * s), int(W * s)
     loo_K_all = K_all.clone()
@@ -80,19 +78,26 @@ def generate_leave_one_out_data(cfg: RI3DConfig):
 
     torch.backends.cudnn.benchmark = True
 
-    # Phase 2 snapshots: progressive corruption (moderate→mild) as the model re-learns
-    # the left-out view. These cover the mid-to-late Stage 1 corruption levels.
+    # Per paper Sec 8.1: training pairs come from phase 2 (after re-adding the
+    # left-out view at iteration 6000, continuing to 10000). Snapshots capture
+    # progressively refined corruption as the model re-learns the left-out view.
     snapshot_steps = set(
         range(cfg.loo_initial_iters, cfg.loo_total_iters, cfg.loo_snapshot_interval)
     )
-    # Phase 1 snapshots: heavy corruption from BEFORE re-adding left-out view.
-    # Critical: the repair model encounters similarly heavy corruption at the START
-    # of Stage 1 optimization (step 0 renders). Without these, the model has never
-    # seen heavy-corruption→clean mappings and falls back on the pretrained tile
-    # ControlNet behavior, which preserves the artifacts instead of removing them.
-    snapshot_steps.update(cfg.loo_phase1_snapshots)
 
     all_indices = list(range(n_images))
+
+    # Compute per-view Gaussian counts for LOO initialization filtering.
+    # Paper Sec 4.2: "We then optimize N separate 3DGS representations on these
+    # subsets" — each LOO model should be initialized with only N-1 views' Gaussians.
+    per_view_counts = []
+    for i in range(n_images):
+        fd = torch.load(out_dir / "fused_depths" / f"fused_depth_{i:03d}.pt", weights_only=True)
+        valid_count = ((fd > 0.01) & torch.isfinite(fd)).sum().item()
+        per_view_counts.append(valid_count)
+    per_view_offsets = [0]
+    for c in per_view_counts:
+        per_view_offsets.append(per_view_offsets[-1] + c)
 
     for left_out_idx in range(n_images):
         name = Path(image_paths[left_out_idx]).stem
@@ -101,7 +106,14 @@ def generate_leave_one_out_data(cfg: RI3DConfig):
         train_indices = [j for j in range(n_images) if j != left_out_idx]
         clean_cpu = gt_images_render[left_out_idx]
 
-        model = GaussianModel(gaussians_init, device)
+        # Filter init_gaussians to exclude left-out view (paper Sec 4.2)
+        lo_start = per_view_offsets[left_out_idx]
+        lo_end = per_view_offsets[left_out_idx + 1]
+        loo_gaussians = {
+            k: torch.cat([v[:lo_start], v[lo_end:]], dim=0)
+            for k, v in gaussians_init.items()
+        }
+        model = GaussianModel(loo_gaussians, device)
         optimizers = model.setup_optimizers(cfg)
         from utils import compute_scene_scale
         loo_scene_scale = compute_scene_scale(poses)
@@ -117,8 +129,8 @@ def generate_leave_one_out_data(cfg: RI3DConfig):
             else:
                 idx = all_indices[step % n_images]
 
-            # Train at reduced resolution (L1-only — SSIM conv2d overhead not needed
-            # for generating corruption patterns, paper doesn't specify LOO loss)
+            # L1-only training — the purpose is to generate corruption patterns,
+            # not achieve best 3DGS quality
             result = model.render_for_optim(
                 w2c_all[idx], loo_K_all[idx], loo_H, loo_W,
                 strategy, strategy_state, step,
@@ -129,7 +141,7 @@ def generate_leave_one_out_data(cfg: RI3DConfig):
             model.step_post_backward(step, result["meta"])
             model.optimizer_step()
 
-            # Snapshot at key points during both phases
+            # Snapshot during phase 2 (after re-adding left-out view)
             # Full resolution — these become the actual repair training pairs
             if step in snapshot_steps:
                 with torch.no_grad():
@@ -258,10 +270,6 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
                            truncation=True, return_tensors="pt").input_ids.to(device)
         text_embeds = text_encoder(tokens)[0]
 
-        empty_tokens = tokenizer("", padding="max_length", max_length=77,
-                                 truncation=True, return_tensors="pt").input_ids.to(device)
-        empty_embeds = text_encoder(empty_tokens)[0]
-
     # Free text encoder — only needed for the two embeddings above
     if _owns_text_encoder and not _owns_components:
         del text_encoder
@@ -355,7 +363,6 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
         batch_size = 1
     n_steps = (n_iters + batch_size - 1) // batch_size
     text_embeds_b = text_embeds.expand(batch_size, -1, -1)
-    empty_embeds_b = empty_embeds.expand(batch_size, -1, -1)
 
     lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=n_steps, eta_min=cfg.repair_lr * 0.01,
@@ -404,30 +411,26 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
         noise_b = torch.cat(noises)
         t_b = torch.cat(ts)
 
-        # CFG dropout: randomly use empty text embedding so the LoRA learns
-        # the unconditional case, preventing hallucination at inference.
-        if random.random() < cfg.repair_cfg_dropout:
-            step_embeds = empty_embeds_b[:actual_bs]
-        else:
-            step_embeds = text_embeds_b[:actual_bs]
+        step_embeds = text_embeds_b[:actual_bs]
 
-        # Standard ControlNet training: noise prediction through frozen UNet.
-        # The UNet backward provides the gradient signal that teaches the LoRA
-        # how corruption maps to clean output — this cannot be approximated.
-        controlnet_output = controlnet(
-            noisy_lat_b, t_b, encoder_hidden_states=step_embeds,
-            controlnet_cond=corrupted_b,
-            return_dict=False,
-        )
+        with torch.amp.autocast("cuda"):
+            controlnet_output = controlnet(
+                noisy_lat_b, t_b, encoder_hidden_states=step_embeds,
+                controlnet_cond=corrupted_b,
+                return_dict=False,
+            )
 
-        noise_pred = unet(
-            noisy_lat_b, t_b, encoder_hidden_states=step_embeds,
-            down_block_additional_residuals=controlnet_output[0],
-            mid_block_additional_residual=controlnet_output[1],
-        ).sample
+            noise_pred = unet(
+                noisy_lat_b, t_b, encoder_hidden_states=step_embeds,
+                down_block_additional_residuals=controlnet_output[0],
+                mid_block_additional_residual=controlnet_output[1],
+            ).sample
 
+        # Standard diffusion loss (MSE between predicted and actual noise)
         loss = F.mse_loss(noise_pred.float(), noise_b.float())
         scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(controlnet.parameters(), max_norm=1.0)
         scaler.step(optimizer)
         scaler.update()
         optimizer.zero_grad(set_to_none=True)

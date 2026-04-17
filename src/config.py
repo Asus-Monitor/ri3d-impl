@@ -44,16 +44,17 @@ class RI3DConfig:
     # Repair model (ControlNet LoRA, DPM++ scheduler, img2img pipeline)
     sd_model: str = "stable-diffusion-v1-5/stable-diffusion-v1-5"
     controlnet_model: str = "lllyasviel/control_v11f1e_sd15_tile"
-    repair_train_iters: int = 1800*5  # paper Sec 8.1: "fine-tune the repair model for 1800 iterations"
-    repair_lr: float = 1e-4
-    repair_lora_rank: int = 48      # moderate rank: enough capacity for corruption→clean mapping without memorizing training pairs
-    repair_lora_dropout: float = 0.05   # light regularization; 0.15 was too aggressive for ~50 pairs
-    repair_lora_alpha_mult: float = 1.0  # standard: lora_alpha = rank; higher values over-amplify LoRA and cause hallucination
-    repair_cfg_dropout: float = 0.1     # 10% chance of empty text embedding during training; teaches unconditional mode for better CFG at inference
-    repair_inference_steps: int = 20    # DPM++ is efficient at 20 steps; more steps = more drift from ControlNet guidance
-    repair_guidance_scale: float = 1.0  # unconditional: text prompt OFF prevents SD1.5 generative prior from hallucinating objects
-    repair_controlnet_scale: float = 1.0  # standard scale; >1.0 over-amplifies structural signal from corrupted input
-    repair_strength: float = 0.80         # moderate denoising: preserves 20% of original signal as safety net; with LoRA (not full fine-tune) lower strength reduces hallucination
+    repair_train_iters: int = 1800
+    repair_lr: float = 5e-5
+    repair_lora_rank: int = 48
+    repair_lora_dropout: float = 0.05
+    repair_lora_alpha_mult: float = 1.0
+    repair_inference_steps: int = 20
+    repair_guidance_scale: float = 1.0
+    repair_controlnet_scale: float = 1.0
+    repair_strength: float = 0.55
+    repair_strength_max: float = 0.75  # Stage 1 start: heavy corruption needs high strength
+    repair_strength_min: float = 0.35  # Stage 1 end: light corruption needs low strength
     repair_positive_prompt: str = "best quality, sharp detail"
     repair_negative_prompt: str = "blur, lowres, bad quality, deformed"
 
@@ -66,19 +67,12 @@ class RI3DConfig:
     # Leave-one-out training for repair
     loo_initial_iters: int = 6000  # iters before re-adding left-out view
     loo_total_iters: int = 10000   # total iters for leave-one-out 3DGS
-    loo_snapshot_interval: int = 300   # denser snapshots for more training pairs
-    loo_render_scale: float = 0.5     # train LOO 3DGS at lower res for speed (snapshots use full res)
-    # Phase 1 snapshots capture heavy corruption (before re-adding left-out view).
-    # The repair model MUST learn to handle these because it encounters similarly
-    # heavy corruption at the start of Stage 1 optimization.
-    # Heavy corruption snapshots: MORE snapshots earlier = more heavy-corruption→clean
-    # pairs. The repair model encounters similarly heavy corruption at Stage 1 start.
-    # Without enough heavy examples, it falls back on tile ControlNet behavior (hallucination).
-    loo_phase1_snapshots: list = field(default_factory=lambda: [1000, 1500, 2000, 2500, 3000, 3500, 4000, 4500, 5000])
+    loo_snapshot_interval: int = 300   # snapshot interval during phase 2 (6000-10000)
+    loo_render_scale: float = 1.0     # LOO 3DGS training resolution scale (1.0 = full res)
 
     # Inpainting model (RealFill-style, per paper Sec 8.2)
     # Paper uses full UNet fine-tune; we use LoRA (attention + conv) for limited VRAM.
-    inpainting_train_iters: int = 500 # paper Sec 8.2: "fine-tune the model for 2000 iterations"
+    inpainting_train_iters: int = 2000 # paper Sec 8.2: "fine-tune the model for 2000 iterations"
     inpainting_lr: float = 2e-4        # RealFill standard UNet LoRA lr
     inpainting_lora_rank: int = 48     # attention + conv LoRA to approximate full fine-tune
 

@@ -71,7 +71,8 @@ def load_repair_pipeline(cfg: RI3DConfig):
 
 
 def repair_image(pipe, image_tensor: torch.Tensor, cfg: RI3DConfig,
-                 view_index: int = 0) -> torch.Tensor:
+                 view_index: int = 0,
+                 strength_override: float | None = None) -> torch.Tensor:
     """Run repair model on a rendered image.
 
     Args:
@@ -79,6 +80,8 @@ def repair_image(pipe, image_tensor: torch.Tensor, cfg: RI3DConfig,
         view_index: deterministic seed offset for this view. Same view_index
             produces same noise → consistent pseudo GT across refresh cycles,
             preventing the optimization from getting conflicting gradients.
+        strength_override: if set, overrides cfg.repair_strength. Used by
+            Stage 1 for adaptive scheduling (high early → low late).
 
     Returns:
         repaired: (H, W, 3) float tensor in [0, 1]
@@ -97,13 +100,15 @@ def repair_image(pipe, image_tensor: torch.Tensor, cfg: RI3DConfig,
     # in pseudo GT come only from actual Gaussian improvement, not noise.
     generator = torch.Generator(device=cfg.device).manual_seed(42 + view_index)
 
+    strength = strength_override if strength_override is not None else cfg.repair_strength
+
     with torch.no_grad():
         result = pipe(
             prompt=cfg.repair_positive_prompt,
             negative_prompt=cfg.repair_negative_prompt,
             image=img_resized,
             control_image=img_resized,
-            strength=cfg.repair_strength,
+            strength=strength,
             num_inference_steps=cfg.repair_inference_steps,
             guidance_scale=cfg.repair_guidance_scale,
             controlnet_conditioning_scale=cfg.repair_controlnet_scale,
@@ -209,20 +214,31 @@ def run_stage1(cfg: RI3DConfig):
     # Cached background masks (recomputed at refresh intervals, not every step)
     cached_bg_masks = [None] * cfg.stage1_num_novel_views
 
+    # Adaptive repair strength: high at start (heavy corruption needs the model
+    # to override more of the input) → low at end (light corruption, preserve structure).
+    # The ControlNet conditioning provides structural safety even at high strength.
+    s_max = cfg.repair_strength_max  # 0.75 — heavy corruption
+    s_min = cfg.repair_strength_min  # 0.35 — light corruption
+
     print(f"\n=== Stage 1 Optimization ===")
     print(f"Input views: {n_images}, Novel views: {cfg.stage1_num_novel_views}")
     print(f"Max iters: {cfg.stage1_max_iters}, Refresh every: {cfg.stage1_refresh_interval}")
+    print(f"Repair strength: {s_max:.2f} → {s_min:.2f} (adaptive)")
     print(f"Densify: {cfg.densify_start}-{cfg.densify_stop}, reset every {cfg.densify_reset_every}")
 
     for step in tqdm(range(cfg.stage1_max_iters), desc="Stage 1"):
 
         # Refresh pseudo ground truth periodically
         if step % cfg.stage1_refresh_interval == 0:
-            print(f"\n  Refreshing pseudo GT at step {step}...")
+            # Adaptive strength: linear interpolation from s_max → s_min over optimization
+            progress = step / max(cfg.stage1_max_iters - 1, 1)
+            cur_strength = s_max + (s_min - s_max) * progress
+            print(f"\n  Refreshing pseudo GT at step {step} (strength={cur_strength:.3f})...")
             with torch.no_grad():
                 for j in range(cfg.stage1_num_novel_views):
                     r = model.render(novel_w2c[j], K_avg, H, W, return_depth=True)
-                    repaired = repair_image(repair_pipe, r["image"], cfg, view_index=j)
+                    repaired = repair_image(repair_pipe, r["image"], cfg, view_index=j,
+                                            strength_override=cur_strength)
                     pseudo_gt[j] = repaired.clamp(0, 1).detach()
                     # Background mask from monocular depth of REPAIRED image (paper Sec 4.3):
                     # "We obtain this background mask by applying agglomerative clustering
@@ -282,15 +298,15 @@ def run_stage1(cfg: RI3DConfig):
                 alpha_mask = get_opacity_mask(result_nov["alpha"])  # (H, W)
                 lambda_j = camera_weights[nov_idx]
 
-                # Term 2: λ_j * M_α * L_rec (LPIPS only every 10th step for speed)
-                # Normalize by M so total novel contribution ≈ single-view magnitude.
-                # Without this, M=8 novel views overwhelm the 1 input view per step.
+                # Term 2: λ_j * M_α * L_rec (paper Eq. 3)
+                # Divide by n_images (not M) to preserve the paper's novel-to-input
+                # ratio when using 1 input view per step instead of summing all N.
                 nov_loss = reconstruction_loss(
                     result_nov["image"], pseudo_gt[nov_idx],
                     ssim_fn, lpips_fn_or_none, cfg,
                     mask=alpha_mask,
                 )
-                view_loss = (lambda_j / cfg.stage1_num_novel_views) * nov_loss
+                view_loss = (lambda_j / n_images) * nov_loss
 
                 # Term 3: ||A ⊙ (1 - M_α) ⊙ M_b||₁
                 bg_mask = cached_bg_masks[nov_idx]
@@ -298,7 +314,7 @@ def run_stage1(cfg: RI3DConfig):
                     opacity_reg = (
                         result_nov["alpha"].squeeze(-1) * (1 - alpha_mask) * bg_mask
                     ).abs().mean()
-                    view_loss = view_loss + (cfg.loss_opacity_reg_weight / cfg.stage1_num_novel_views) * opacity_reg
+                    view_loss = view_loss + (cfg.loss_opacity_reg_weight / n_images) * opacity_reg
 
                 view_loss.backward()
                 loss_val += view_loss.item()
