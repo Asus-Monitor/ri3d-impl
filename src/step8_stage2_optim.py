@@ -45,9 +45,12 @@ from utils import (
 
 
 def load_inpainting_pipeline(cfg: RI3DConfig):
-    """Load the trained inpainting model for inference (per-scene LoRA + LCM)."""
-    from diffusers import StableDiffusionInpaintPipeline, LCMScheduler
-    from peft import PeftModel
+    """Load the trained inpainting model for inference (per-scene fine-tuned UNet)."""
+    from diffusers import (
+        StableDiffusionInpaintPipeline,
+        UNet2DConditionModel,
+        DPMSolverMultistepScheduler,
+    )
 
     model_dir = cfg.scene_output_dir() / "inpainting_model"
     dtype = cfg.dtype
@@ -58,10 +61,10 @@ def load_inpainting_pipeline(cfg: RI3DConfig):
         inpaint_model_id, torch_dtype=dtype
     ).to(device)
 
-    pipe.unet = PeftModel.from_pretrained(pipe.unet, model_dir)
-    pipe.unet = pipe.unet.merge_and_unload()
-    pipe.scheduler = LCMScheduler.from_config(pipe.scheduler.config)
-    pipe.load_lora_weights(cfg.lcm_lora, adapter_name="lcm")
+    pipe.unet = UNet2DConditionModel.from_pretrained(
+        model_dir, torch_dtype=dtype).to(device)
+    pipe.scheduler = DPMSolverMultistepScheduler.from_config(
+        pipe.scheduler.config, use_karras_sigmas=True)
     pipe.safety_checker = None
 
     return pipe

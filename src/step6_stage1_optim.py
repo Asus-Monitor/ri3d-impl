@@ -34,7 +34,7 @@ from step4_gaussian_init import generate_elliptical_cameras
 
 
 def load_repair_pipeline(cfg: RI3DConfig):
-    """Load the trained repair model for inference (per-scene ControlNet LoRA).
+    """Load the trained repair model for inference (per-scene fine-tuned ControlNet).
 
     Uses img2img ControlNet pipeline. The corrupted render is both the img2img
     input (preserving coarse color/layout through retained signal) and the
@@ -47,17 +47,13 @@ def load_repair_pipeline(cfg: RI3DConfig):
         ControlNetModel,
         DPMSolverMultistepScheduler,
     )
-    from peft import PeftModel
 
     model_dir = cfg.scene_output_dir() / "repair_model"
     dtype = cfg.dtype
     device = cfg.device
 
-    
-    controlnet_lora_dir = model_dir / "controlnet"
-    controlnet = ControlNetModel.from_pretrained(cfg.controlnet_model, torch_dtype=dtype, use_safetensors=False)
-    controlnet = PeftModel.from_pretrained(controlnet, controlnet_lora_dir)
-    controlnet = controlnet.merge_and_unload()
+    controlnet = ControlNetModel.from_pretrained(
+        model_dir / "controlnet", torch_dtype=dtype)
 
     pipe = StableDiffusionControlNetImg2ImgPipeline.from_pretrained(
         cfg.sd_model, controlnet=controlnet, torch_dtype=dtype,

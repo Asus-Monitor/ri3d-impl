@@ -159,10 +159,10 @@ def run_prep_all_scenes(cfg: RI3DConfig):
 
 
 def run_train_models(cfg: RI3DConfig, single_scene: bool = False):
-    """Train per-scene repair + inpainting models.
+    """Train per-scene repair + inpainting models (full fine-tuning).
 
     Loads frozen SD components once and shares them across scenes to avoid
-    redundant model loading. Each scene gets its own personalized LoRA weights.
+    redundant model loading. Each scene gets its own fine-tuned weights.
 
     If single_scene=True, only trains for cfg's scene (from --scene flag).
     """
@@ -227,7 +227,7 @@ def run_train_models(cfg: RI3DConfig, single_scene: bool = False):
 
     # --- Step 7: Inpainting models (share SD inpainting components) ---
     need_inpaint = [sc for sc in ready
-                    if not (sc.scene_output_dir() / "inpainting_model").exists()]
+                    if not (sc.scene_output_dir() / "inpainting_model" / "config.json").exists()]
     if need_inpaint:
         print(f"\n--- Step 7: Inpainting Model — {len(need_inpaint)} scenes ---")
         from diffusers import AutoencoderKL, DDPMScheduler

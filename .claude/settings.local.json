@@ -35,7 +35,8 @@
       "Bash(grep -E \"\\\\.py$|^d\")",
       "Bash(du -sh /home/vy/.cache/huggingface/hub/models--*)",
       "Bash(du -sh /home/vy/ri3d-impl/output/*/repair_training_data/)",
-      "Bash(du -sh /home/vy/ri3d-impl/output/*/)"
+      "Bash(du -sh /home/vy/ri3d-impl/output/*/)",
+      "Bash(pip install *)"
     ]
   }
 }

@@ -41,14 +41,11 @@ class RI3DConfig:
     gaussian_scale_factor: float = 1.4  # scale relative to pixel size
     gaussian_init_opacity: float = 0.1
 
-    # Repair model (ControlNet LoRA, DPM++ scheduler, img2img pipeline)
+    # Repair model (full ControlNet fine-tune, DPM++ scheduler, img2img pipeline)
     sd_model: str = "stable-diffusion-v1-5/stable-diffusion-v1-5"
     controlnet_model: str = "lllyasviel/control_v11f1e_sd15_tile"
     repair_train_iters: int = 1800
-    repair_lr: float = 5e-5
-    repair_lora_rank: int = 48
-    repair_lora_dropout: float = 0.05
-    repair_lora_alpha_mult: float = 1.0
+    repair_lr: float = 1e-5  # full fine-tuning lr (lower than LoRA)
     repair_inference_steps: int = 20
     repair_guidance_scale: float = 1.0
     repair_controlnet_scale: float = 1.0
@@ -58,9 +55,8 @@ class RI3DConfig:
     repair_positive_prompt: str = "best quality, sharp detail"
     repair_negative_prompt: str = "blur, lowres, bad quality, deformed"
 
-    # Inpainting inference (LCM for speed)
-    lcm_lora: str = "latent-consistency/lcm-lora-sdv1-5"
-    inpainting_inference_steps: int = 8   # LCM steps
+    # Inpainting inference (standard DPM++ scheduler)
+    inpainting_inference_steps: int = 30   # DPM++ steps
     inpainting_guidance_scale: float = 1.0   # no CFG — empty prompt means no text direction
     inpainting_strength: float = 1.0  # full noise in masked regions for maximum generation freedom
 
@@ -70,11 +66,9 @@ class RI3DConfig:
     loo_snapshot_interval: int = 300   # snapshot interval during phase 2 (6000-10000)
     loo_render_scale: float = 1.0     # LOO 3DGS training resolution scale (1.0 = full res)
 
-    # Inpainting model (RealFill-style, per paper Sec 8.2)
-    # Paper uses full UNet fine-tune; we use LoRA (attention + conv) for limited VRAM.
+    # Inpainting model (RealFill-style full UNet fine-tune, per paper Sec 4.2, 8.2)
     inpainting_train_iters: int = 2000 # paper Sec 8.2: "fine-tune the model for 2000 iterations"
-    inpainting_lr: float = 2e-4        # RealFill standard UNet LoRA lr
-    inpainting_lora_rank: int = 48     # attention + conv LoRA to approximate full fine-tune
+    inpainting_lr: float = 2e-5        # full UNet fine-tuning lr
 
     # Stage 1 optimization
     stage1_max_iters: int = 4000

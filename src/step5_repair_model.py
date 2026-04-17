@@ -1,16 +1,16 @@
-"""Step 5: Train the Repair Model (ControlNet + LoRA).
+"""Step 5: Train the Repair Model (full ControlNet fine-tuning).
 
 Per the paper (Sec 4.2, 8.1):
   1. Leave-one-out: create N subsets of N-1 images, train N 3DGS reps
      (6000 iters without left-out view, then to 10000 with it re-added)
   2. Snapshot intermediate renders -> training pairs (corrupted, clean)
-  3. Fine-tune ControlNet (tile) with LoRA on this scene's pairs for 1800 iters
+  3. Fine-tune ControlNet (tile) on this scene's pairs for 1800 iters
 
 Models are personalized per-scene so the repair model matches the scene's visual style.
 
 Outputs:
   - outputs/<scene>/repair_training_data/  corrupted/clean pairs
-  - outputs/<scene>/repair_model/          fine-tuned ControlNet LoRA weights
+  - outputs/<scene>/repair_model/          fine-tuned ControlNet weights
 """
 import argparse
 import random
@@ -198,10 +198,11 @@ def generate_all_scenes_data(cfg: RI3DConfig):
 
 
 def train_repair_model(cfg: RI3DConfig, shared_components=None):
-    """Train a per-scene repair model (ControlNet LoRA) on this scene's leave-one-out data.
+    """Train a per-scene repair model (full ControlNet fine-tuning) on leave-one-out data.
 
-    Per the paper: fine-tune the ControlNet on corrupted/clean pairs so it learns
-    scene-specific repair. The UNet stays frozen.
+    Per the paper (Sec 4.2): fine-tune the ControlNet on corrupted/clean pairs so
+    it learns scene-specific repair. The UNet stays frozen; only ControlNet
+    parameters are updated. Gradient checkpointing keeps memory tractable.
 
     Args:
         cfg: scene config
@@ -215,7 +216,6 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
         UNet2DConditionModel,
     )
     from transformers import CLIPTextModel, CLIPTokenizer
-    from peft import LoraConfig, get_peft_model
 
     model_dir = cfg.scene_output_dir() / "repair_model"
     model_dir.mkdir(parents=True, exist_ok=True)
@@ -320,44 +320,29 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
     torch.cuda.empty_cache()
 
     
+    # FP16 model + 8-bit Adam: keeps everything on GPU with ~3x less
+    # optimizer memory than FP32 Adam.  bitsandbytes AdamW8bit maintains
+    # FP32 master weights internally, avoiding FP16 precision loss.
     controlnet = ControlNetModel.from_pretrained(cfg.controlnet_model,
                                                   torch_dtype=dtype, use_safetensors=False).to(device)
-    lora_alpha = int(cfg.repair_lora_rank * cfg.repair_lora_alpha_mult)
-    lora_config = LoraConfig(
-        r=cfg.repair_lora_rank,
-        lora_alpha=lora_alpha,
-        target_modules=[
-            "to_q", "to_v", "to_k", "to_out.0",  
-            "conv1", "conv2",                       
-            "proj_in", "proj_out",                  
-            "controlnet_cond_embedding.conv_in",
-            "controlnet_cond_embedding.blocks.0",
-            "controlnet_cond_embedding.blocks.1",
-            "controlnet_cond_embedding.blocks.2",
-            "controlnet_cond_embedding.blocks.3",
-            "controlnet_cond_embedding.blocks.4",
-            "controlnet_cond_embedding.blocks.5",
-            "controlnet_cond_embedding.conv_out",
-        ],
-        lora_dropout=cfg.repair_lora_dropout,
-    )
-    controlnet = get_peft_model(controlnet, lora_config)
-    controlnet.print_trainable_parameters()
+    controlnet.requires_grad_(True)
+    controlnet.enable_gradient_checkpointing()
+    controlnet.train()
+    n_params = sum(p.numel() for p in controlnet.parameters() if p.requires_grad)
+    print(f"Full ControlNet fine-tuning: {n_params:,} trainable parameters")
 
-    
     unet.requires_grad_(False)
     unet.eval()
 
-    optimizer = torch.optim.AdamW(controlnet.parameters(), lr=cfg.repair_lr, weight_decay=1e-2)
+    import bitsandbytes as bnb
+    optimizer = bnb.optim.AdamW8bit(controlnet.parameters(), lr=cfg.repair_lr, weight_decay=1e-2)
 
     n_iters = cfg.repair_train_iters
     max_t = noise_scheduler.config.num_train_timesteps
 
     
     gpu_mem_gb = torch.cuda.get_device_properties(device).total_memory / (1024 ** 3)
-    if gpu_mem_gb >= 20:
-        batch_size = 4
-    elif gpu_mem_gb >= 7:
+    if gpu_mem_gb >= 24:
         batch_size = 2
     else:
         batch_size = 1
@@ -368,9 +353,7 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
         optimizer, T_max=n_steps, eta_min=cfg.repair_lr * 0.01,
     )
 
-    scaler = torch.amp.GradScaler("cuda")
-
-    print(f"Training ControlNet LoRA for {n_iters} iterations (batch={batch_size}) "
+    print(f"Training ControlNet (full fine-tune) for {n_iters} iterations (batch={batch_size}) "
           f"on {n_pairs} pairs...")
     losses = []
     iter_count = 0
@@ -428,11 +411,10 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
 
         
         loss = F.mse_loss(noise_pred.float(), noise_b.float())
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(controlnet.parameters(), max_norm=1.0)
-        scaler.step(optimizer)
-        scaler.update()
+        loss.backward()
+        grad_norm = torch.nn.utils.clip_grad_norm_(controlnet.parameters(), max_norm=1.0)
+        if torch.isfinite(grad_norm):
+            optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         lr_scheduler.step()
 
@@ -444,8 +426,7 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
             print(f"  Step ~{min(iter_count, n_iters)}: loss = {avg_loss:.6f}")
 
     controlnet.save_pretrained(model_dir / "controlnet")
-    (model_dir / "unet_frozen").touch()
-    print(f"Saved repair model (ControlNet LoRA incl. cond_embedding) to {model_dir}")
+    print(f"Saved repair model (full ControlNet) to {model_dir}")
 
     fig, ax = plt.subplots(figsize=(10, 4))
     ax.plot(losses)

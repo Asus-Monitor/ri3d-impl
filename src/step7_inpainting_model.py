@@ -1,14 +1,14 @@
-"""Step 7: Train the Inpainting Model (SD Inpainting + LoRA, RealFill-style).
+"""Step 7: Train the Inpainting Model (full SD Inpainting UNet fine-tuning, RealFill-style).
 
 Per the paper (Sec 4.2, 8.2):
   - Fine-tune SD inpainting model on the scene's input images via random masking
   - This personalizes the model so hallucinated content matches the scene's visual style
   - Images are resized so smallest dim = 512, then random 512x512 crop
   - Fine-tune for 2000 iterations per scene
-  - Paper uses full UNet fine-tune; we approximate with LoRA (attention + conv)
+  - Full UNet fine-tuning following RealFill (Tang et al. / Nguyen implementation)
 
 Outputs:
-  - outputs/<scene>/inpainting_model/   per-scene LoRA weights
+  - outputs/<scene>/inpainting_model/   per-scene fine-tuned UNet weights
 """
 import argparse
 import random
@@ -65,7 +65,11 @@ def collect_scene_images(cfg: RI3DConfig) -> list[Image.Image]:
 
 
 def train_inpainting_model(cfg: RI3DConfig, shared_components=None):
-    """Train a per-scene inpainting model on this scene's input images.
+    """Train a per-scene inpainting model (full UNet fine-tuning) on this scene's images.
+
+    Per the paper (Sec 4.2, 8.2): fine-tune the Stable Diffusion inpainting model
+    following RealFill methodology (Tang et al.). All UNet parameters are trained;
+    VAE and text encoder stay frozen. Gradient checkpointing keeps memory tractable.
 
     Args:
         cfg: scene config
@@ -78,7 +82,6 @@ def train_inpainting_model(cfg: RI3DConfig, shared_components=None):
         DDPMScheduler,
     )
     from transformers import CLIPTextModel, CLIPTokenizer
-    from peft import LoraConfig, get_peft_model
 
     model_dir = cfg.scene_output_dir() / "inpainting_model"
     model_dir.mkdir(parents=True, exist_ok=True)
@@ -159,42 +162,33 @@ def train_inpainting_model(cfg: RI3DConfig, shared_components=None):
     
     
     
+    # FP16 model + 8-bit Adam: keeps everything on GPU with ~3x less
+    # optimizer memory than FP32 Adam.
     unet = UNet2DConditionModel.from_pretrained(inpaint_model_id, subfolder="unet",
                                                  torch_dtype=dtype).to(device)
-    lora_config = LoraConfig(
-        r=cfg.inpainting_lora_rank,
-        lora_alpha=2 * cfg.inpainting_lora_rank,  
-        target_modules=[
-            "to_q", "to_v", "to_k", "to_out.0",  
-            "conv1", "conv2",                       
-        ],
-        lora_dropout=0.05,
-    )
-    unet = get_peft_model(unet, lora_config)
-    unet.print_trainable_parameters()
+    unet.requires_grad_(True)
+    unet.enable_gradient_checkpointing()
+    unet.train()
+    n_params = sum(p.numel() for p in unet.parameters() if p.requires_grad)
+    print(f"Full UNet fine-tuning: {n_params:,} trainable parameters")
 
-    optimizer = torch.optim.AdamW(unet.parameters(), lr=cfg.inpainting_lr, weight_decay=1e-2)
+    import bitsandbytes as bnb
+    optimizer = bnb.optim.AdamW8bit(unet.parameters(), lr=cfg.inpainting_lr, weight_decay=1e-2)
 
     n_iters = cfg.inpainting_train_iters
     max_t = noise_scheduler.config.num_train_timesteps
 
     
     gpu_mem_gb = torch.cuda.get_device_properties(device).total_memory / (1024 ** 3)
-    if gpu_mem_gb >= 20:
-        batch_size = 4
-    elif gpu_mem_gb >= 12:
+    if gpu_mem_gb >= 24:
         batch_size = 2
     else:
         batch_size = 1
     n_steps = (n_iters + batch_size - 1) // batch_size
     text_embeds_b = text_embeds.expand(batch_size, -1, -1)
 
-    
-    
-    scaler = torch.amp.GradScaler("cuda")
-
-    print(f"Training inpainting LoRA for {n_iters} iterations (batch={batch_size}) "
-          f"on {n_images} images...")
+    print(f"Training inpainting UNet (full fine-tune) for {n_iters} iterations "
+          f"(batch={batch_size}) on {n_images} images...")
     losses = []
     iter_count = 0
 
@@ -251,14 +245,16 @@ def train_inpainting_model(cfg: RI3DConfig, shared_components=None):
 
         noisy_lat_b = noise_scheduler.add_noise(clean_lat_b, noise_b, t_b)
         unet_input = torch.cat([noisy_lat_b, mask_lat_b, masked_lat_b], dim=1)
-        noise_pred = unet(unet_input, t_b, encoder_hidden_states=text_embeds_b[:actual_bs]).sample
+
+        with torch.amp.autocast("cuda"):
+            noise_pred = unet(unet_input, t_b, encoder_hidden_states=text_embeds_b[:actual_bs]).sample
 
         loss = F.mse_loss(noise_pred.float(), noise_b.float())
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(unet.parameters(), 1.0)
-        scaler.step(optimizer)
-        scaler.update()
+        loss.backward()
+
+        grad_norm = torch.nn.utils.clip_grad_norm_(unet.parameters(), 1.0)
+        if torch.isfinite(grad_norm):
+            optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
         iter_count += actual_bs
@@ -287,8 +283,11 @@ def train_inpainting_model(cfg: RI3DConfig, shared_components=None):
 
 def test_inpainting_model(cfg: RI3DConfig):
     """Test inpainting model with multiple mask positions per image."""
-    from diffusers import StableDiffusionInpaintPipeline, LCMScheduler
-    from peft import PeftModel
+    from diffusers import (
+        StableDiffusionInpaintPipeline,
+        UNet2DConditionModel,
+        DPMSolverMultistepScheduler,
+    )
 
     out_dir = cfg.scene_output_dir()
     model_dir = out_dir / "inpainting_model"
@@ -308,10 +307,10 @@ def test_inpainting_model(cfg: RI3DConfig):
         inpaint_model_id, torch_dtype=dtype
     ).to(device)
 
-    pipe.unet = PeftModel.from_pretrained(pipe.unet, model_dir)
-    pipe.unet = pipe.unet.merge_and_unload()
-    pipe.scheduler = LCMScheduler.from_config(pipe.scheduler.config)
-    pipe.load_lora_weights(cfg.lcm_lora, adapter_name="lcm")
+    pipe.unet = UNet2DConditionModel.from_pretrained(
+        model_dir, torch_dtype=dtype).to(device)
+    pipe.scheduler = DPMSolverMultistepScheduler.from_config(
+        pipe.scheduler.config, use_karras_sigmas=True)
     pipe.safety_checker = None
 
     image_paths = cfg.load_image_paths()
