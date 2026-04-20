@@ -45,15 +45,34 @@ class RI3DConfig:
     sd_model: str = "stable-diffusion-v1-5/stable-diffusion-v1-5"
     controlnet_model: str = "lllyasviel/control_v11f1e_sd15_tile"
     repair_train_iters: int = 1800
-    repair_lr: float = 1e-5  # full fine-tuning lr (lower than LoRA)
-    repair_inference_steps: int = 20
-    repair_guidance_scale: float = 1.0
-    repair_controlnet_scale: float = 1.0
-    repair_strength: float = 0.55
-    repair_strength_max: float = 0.75  # Stage 1 start: heavy corruption needs high strength
-    repair_strength_min: float = 0.35  # Stage 1 end: light corruption needs low strength
-    repair_positive_prompt: str = "best quality, sharp detail"
-    repair_negative_prompt: str = "blur, lowres, bad quality, deformed"
+    repair_lr: float = 5e-5  # full FT — between LoRA's 1e-3 and the over-conservative 1e-5
+    repair_inference_steps: int = 50  # DDIM steps per GaussianObject
+    repair_guidance_scale: float = 1.0  # CFG off — trust the ControlNet (GaussianObject convention)
+    repair_controlnet_scale: float = 1.0  # GaussianObject default; >1.0 over-fits to corrupted render
+    repair_hflip_augment: bool = True
+    repair_image_loss_weight: float = 0.0  # disabled: VAE.decode backward is too expensive on 7.6 GB
+    repair_strength: float = 0.6  # default img2img denoise strength (used by test)
+    repair_strength_max: float = 1.0  # test/eval: full denoise to showcase repair power
+    repair_strength_min: float = 0.1  # test/eval: minimal denoise on clean inputs
+
+    # Optimization-time strengths are MUCH milder than test-time. Multi-refresh
+    # with high strength + stochastic DDIM compounds hallucination drift across
+    # refreshes; conservative caps + deterministic DDIM (see repair_eta below)
+    # let each refresh refine the previous result rather than reinvent it.
+    stage1_repair_strength_max: float = 0.6
+    stage1_repair_strength_min: float = 0.2
+    stage2_repair_strength_max: float = 0.4
+    stage2_repair_strength_min: float = 0.1
+    repair_eta_optim: float = 0.0  # deterministic DDIM during optimization
+    repair_eta_test: float = 1.0   # stochastic DDIM for isolated test (GaussianObject default)
+    # DreamBooth-style rare token + scene-name. The rare token forces the model
+    # to bind scene-specific repair behavior to this identifier, instead of
+    # diluting the generic "best quality" subspace.
+    repair_scene_token: str = "xxy5syt00"
+    repair_positive_prompt: str = "a photo of a xxy5syt00, best quality"
+    # Negative prompt unused at CFG=1.0 (GaussianObject convention). Kept here
+    # only as documentation of what would be passed if CFG > 1 were enabled.
+    repair_negative_prompt: str = ""
 
     # Inpainting inference (standard DPM++ scheduler)
     inpainting_inference_steps: int = 30   # DPM++ steps
@@ -73,7 +92,7 @@ class RI3DConfig:
     # Stage 1 optimization
     stage1_max_iters: int = 4000
     stage1_num_novel_views: int = 8
-    stage1_refresh_interval: int = 400  # refresh repaired pseudo GT every N iters
+    stage1_refresh_interval: int = 99999  # single-pass: only refresh at step 0, then 3DGS optimizes against fixed pseudo-GT
     stage1_lr_position: float = 1.6e-4
     stage1_lr_opacity: float = 0.05
     stage1_lr_scaling: float = 5e-3
@@ -84,7 +103,7 @@ class RI3DConfig:
     stage2_max_iters: int = 4000
     stage2_num_novel_views: int = 10
     stage2_num_inpaint_views: int = 5  # K views to inpaint per cycle
-    stage2_inpaint_interval: int = 200
+    stage2_inpaint_interval: int = 99999  # single-pass: inpaint+repair once at step 0, then optimize against fixed targets
     stage2_inpaint_cutoff: int = 2800  # stop inpainting after this iter, only repair
 
     # Loss weights

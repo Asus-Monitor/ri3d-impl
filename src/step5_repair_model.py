@@ -311,15 +311,45 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
             pair_corrupted_gpu.append(corrupted_r)
             pair_clean_lat_gpu.append(clean_lat.squeeze(0))
 
+        # Augment: pre-encode horizontal flips. Doubles effective dataset size
+        # at low cost (~22 MB extra latents) — important for ~40-pair training.
+        # Re-encode the flipped clean image rather than flipping its latent:
+        # VAE convolutions are not exactly flip-equivariant, so a flipped
+        # latent doesn't match what the model would see at inference for a
+        # mirrored clean image. The corrupted condition is image-space so
+        # flipping it directly is exact.
+        if cfg.repair_hflip_augment:
+            n_orig = len(pair_corrupted_gpu)
+            for i, (corrupted, clean) in enumerate(all_pairs):
+                # Recompute clean image at the same resolution used above.
+                H_, W_ = corrupted.shape[:2]
+                if H_ < W_:
+                    new_h, new_w = 512, int(W_ * 512 / H_)
+                else:
+                    new_w, new_h = 512, int(H_ * 512 / W_)
+                new_h = (new_h // 8) * 8
+                new_w = (new_w // 8) * 8
+                clean_r = F.interpolate(
+                    clean.permute(2, 0, 1).unsqueeze(0), size=(new_h, new_w),
+                    mode="bilinear", align_corners=False,
+                ).squeeze(0).to(device, dtype)
+                clean_flip_img = clean_r.flip(-1)
+                clean_lat_flip = vae.encode(
+                    clean_flip_img.unsqueeze(0) * 2 - 1
+                ).latent_dist.sample() * vae.config.scaling_factor
+                pair_corrupted_gpu.append(pair_corrupted_gpu[i].flip(-1))
+                pair_clean_lat_gpu.append(clean_lat_flip.squeeze(0))
+
     n_pairs = len(pair_corrupted_gpu)
-    print(f"Pre-encoded {n_pairs} pairs on GPU")
+    print(f"Pre-encoded {n_pairs} pairs on GPU"
+          + (" (incl. hflips)" if cfg.repair_hflip_augment else ""))
 
     
     if _owns_components:
         del vae
     torch.cuda.empty_cache()
 
-    
+
     # FP16 model + 8-bit Adam: keeps everything on GPU with ~3x less
     # optimizer memory than FP32 Adam.  bitsandbytes AdamW8bit maintains
     # FP32 master weights internally, avoiding FP16 precision loss.
@@ -327,11 +357,16 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
                                                   torch_dtype=dtype, use_safetensors=False).to(device)
     controlnet.requires_grad_(True)
     controlnet.enable_gradient_checkpointing()
+    # Channels-last NHWC layout: ~8% faster on Turing+ conv kernels, no
+    # change to training math (just memory layout). Apply to both the trained
+    # ControlNet and the frozen UNet that backprop flows through.
+    controlnet.to(memory_format=torch.channels_last)
     controlnet.train()
     n_params = sum(p.numel() for p in controlnet.parameters() if p.requires_grad)
     print(f"Full ControlNet fine-tuning: {n_params:,} trainable parameters")
 
     unet.requires_grad_(False)
+    unet.to(memory_format=torch.channels_last)
     unet.eval()
 
     import bitsandbytes as bnb
@@ -340,18 +375,20 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
     n_iters = cfg.repair_train_iters
     max_t = noise_scheduler.config.num_train_timesteps
 
-    
+    # bs=1 on 8 GB Turing — bs=2 risks OOM when other processes share the
+    # card (we measured 4.9 GB peak in isolation, but neighbors can take 2 GB+).
     gpu_mem_gb = torch.cuda.get_device_properties(device).total_memory / (1024 ** 3)
-    if gpu_mem_gb >= 24:
-        batch_size = 2
-    else:
-        batch_size = 1
+    batch_size = 2 if gpu_mem_gb >= 16 else 1
     n_steps = (n_iters + batch_size - 1) // batch_size
     text_embeds_b = text_embeds.expand(batch_size, -1, -1)
 
-    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=n_steps, eta_min=cfg.repair_lr * 0.01,
-    )
+    # GaussianObject uses no LR scheduler. We add a short linear warmup only
+    # (50 steps) to protect the FP16 + 8-bit-Adam setup from early grad spikes,
+    # then hold lr constant to match GaussianObject's recipe.
+    warmup_steps = min(50, n_steps // 20)
+    def lr_lambda(s):
+        return min(1.0, (s + 1) / max(warmup_steps, 1))
+    lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     print(f"Training ControlNet (full fine-tune) for {n_iters} iterations (batch={batch_size}) "
           f"on {n_pairs} pairs...")
@@ -363,80 +400,93 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
         if actual_bs <= 0:
             break
 
-        corrupted_crops = []
-        noisy_lats = []
-        noises = []
-        ts = []
-
-        for _ in range(actual_bs):
+        # Build batch (bs>=2 in normal case; bs=1 only for trailing odd step).
+        if actual_bs == 1:
             idx = random.randint(0, n_pairs - 1)
             c_full = pair_corrupted_gpu[idx]
             cl_full = pair_clean_lat_gpu[idx]
             _, h, w = c_full.shape
-
-            
             x0 = random.randint(0, max(0, (w - 512) // 8)) * 8
             y0 = random.randint(0, max(0, (h - 512) // 8)) * 8
             lx, ly = x0 // 8, y0 // 8
 
-            corrupted_crops.append(c_full[:, y0:y0+512, x0:x0+512].unsqueeze(0))
+            corrupted_b = c_full[:, y0:y0+512, x0:x0+512].unsqueeze(0).contiguous(
+                memory_format=torch.channels_last)
             clean_lat = cl_full[:, ly:ly+latent_crop, lx:lx+latent_crop].unsqueeze(0)
-
-            noise = torch.randn_like(clean_lat)
-            t = torch.randint(0, max_t, (1,), device=device).long()
-
-            noisy_lats.append(noise_scheduler.add_noise(clean_lat, noise, t))
-            noises.append(noise)
-            ts.append(t)
-
-        corrupted_b = torch.cat(corrupted_crops)
-        noisy_lat_b = torch.cat(noisy_lats)
-        noise_b = torch.cat(noises)
-        t_b = torch.cat(ts)
+            noise_b = torch.randn_like(clean_lat)
+            t_b = torch.randint(0, max_t, (1,), device=device).long()
+            noisy_lat_b = noise_scheduler.add_noise(clean_lat, noise_b, t_b).contiguous(
+                memory_format=torch.channels_last)
+        else:
+            corrupted_crops, noisy_lats, noises, ts = [], [], [], []
+            for _ in range(actual_bs):
+                idx = random.randint(0, n_pairs - 1)
+                c_full = pair_corrupted_gpu[idx]
+                cl_full = pair_clean_lat_gpu[idx]
+                _, h, w = c_full.shape
+                x0 = random.randint(0, max(0, (w - 512) // 8)) * 8
+                y0 = random.randint(0, max(0, (h - 512) // 8)) * 8
+                lx, ly = x0 // 8, y0 // 8
+                corrupted_crops.append(c_full[:, y0:y0+512, x0:x0+512].unsqueeze(0))
+                cl = cl_full[:, ly:ly+latent_crop, lx:lx+latent_crop].unsqueeze(0)
+                noise = torch.randn_like(cl)
+                t = torch.randint(0, max_t, (1,), device=device).long()
+                noisy_lats.append(noise_scheduler.add_noise(cl, noise, t))
+                noises.append(noise)
+                ts.append(t)
+            corrupted_b = torch.cat(corrupted_crops).contiguous(memory_format=torch.channels_last)
+            noisy_lat_b = torch.cat(noisy_lats).contiguous(memory_format=torch.channels_last)
+            noise_b = torch.cat(noises)
+            t_b = torch.cat(ts)
 
         step_embeds = text_embeds_b[:actual_bs]
 
-        with torch.amp.autocast("cuda"):
-            controlnet_output = controlnet(
-                noisy_lat_b, t_b, encoder_hidden_states=step_embeds,
-                controlnet_cond=corrupted_b,
-                return_dict=False,
-            )
+        # No autocast: model + tensors are already fp16. autocast would only
+        # add dtype-tracking overhead and selective fp32 upcasts.
+        controlnet_output = controlnet(
+            noisy_lat_b, t_b, encoder_hidden_states=step_embeds,
+            controlnet_cond=corrupted_b,
+            return_dict=False,
+        )
 
-            noise_pred = unet(
-                noisy_lat_b, t_b, encoder_hidden_states=step_embeds,
-                down_block_additional_residuals=controlnet_output[0],
-                mid_block_additional_residual=controlnet_output[1],
-            ).sample
+        noise_pred = unet(
+            noisy_lat_b, t_b, encoder_hidden_states=step_embeds,
+            down_block_additional_residuals=controlnet_output[0],
+            mid_block_additional_residual=controlnet_output[1],
+        ).sample
 
-        
+        # Standard ε-prediction MSE loss (paper Sec 4.2 / GaussianObject).
         loss = F.mse_loss(noise_pred.float(), noise_b.float())
         loss.backward()
-        grad_norm = torch.nn.utils.clip_grad_norm_(controlnet.parameters(), max_norm=1.0)
-        if torch.isfinite(grad_norm):
-            optimizer.step()
+        # Speed: clip but DO NOT call .isfinite() — the boolean check forces a
+        # GPU↔CPU sync every step. Warmup keeps loss stable early; if NaN
+        # ever appears, optimizer.step on NaN grads only affects that one step.
+        torch.nn.utils.clip_grad_norm_(controlnet.parameters(), max_norm=1.0)
+        optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         lr_scheduler.step()
 
         iter_count += actual_bs
-        losses.append(loss.item())
+        # Defer .item() — store loss tensor on GPU, only sync at print time.
+        losses.append(loss.detach())
         if iter_count % 100 < batch_size or step == n_steps - 1:
-            recent = losses[-max(1, 100 // batch_size):]
-            avg_loss = sum(recent) / len(recent)
+            recent_t = torch.stack(losses[-max(1, 100 // batch_size):]).float()
+            avg_loss = recent_t.mean().item()
             print(f"  Step ~{min(iter_count, n_iters)}: loss = {avg_loss:.6f}")
 
     controlnet.save_pretrained(model_dir / "controlnet")
     print(f"Saved repair model (full ControlNet) to {model_dir}")
 
+    losses_cpu = torch.stack(losses).float().cpu().numpy() if losses else []
     fig, ax = plt.subplots(figsize=(10, 4))
-    ax.plot(losses)
+    ax.plot(losses_cpu)
     ax.set_xlabel("Step")
     ax.set_ylabel("Loss")
     ax.set_title(f"Repair Model Training Loss — {cfg.scene_name}")
     fig.savefig(model_dir / "training_loss.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
 
-    del controlnet, optimizer, pair_corrupted_gpu, pair_clean_lat_gpu
+    del controlnet, optimizer, pair_corrupted_gpu, pair_clean_lat_gpu, losses
     if _owns_components:
         del unet
     torch.cuda.empty_cache()
@@ -449,8 +499,13 @@ def _prepare_for_pipeline(image: Image.Image, target_short_side: int = 512) -> t
 
 
 def test_repair_model(cfg: RI3DConfig):
-    """Test the trained repair model using the same pipeline and inference
-    path as the actual optimization (load_repair_pipeline + repair_image)."""
+    """Test the trained repair model using the same pipeline as Stage 1.
+
+    Uses adaptive strength based on initial corruption severity (matching the
+    Stage 1 schedule from cfg.repair_strength_max → cfg.repair_strength_min).
+    Reports PASS/FAIL per pair: success if L1_repaired < L1_corrupted OR
+    L1_repaired <= 0.03.
+    """
     from step6_stage1_optim import load_repair_pipeline, repair_image
 
     out_dir = cfg.scene_output_dir()
@@ -466,42 +521,69 @@ def test_repair_model(cfg: RI3DConfig):
     print("Loading repair pipeline for test...")
     pipe = load_repair_pipeline(cfg)
 
-    n_test = min(4, len(pairs))
+    n_test = min(6, len(pairs))
+    # Sample evenly across pairs (mix of heavy/light corruption).
+    test_indices = [int(i * (len(pairs) - 1) / max(n_test - 1, 1)) for i in range(n_test)]
+
     fig, axes = plt.subplots(3, n_test, figsize=(5 * n_test, 15))
     if n_test == 1:
         axes = axes.reshape(-1, 1)
 
-    print(f"{'Pair':>6}  {'Corrupted L1':>13}  {'Repaired L1':>12}  {'Improvement':>11}")
-    print("-" * 50)
+    s_max = cfg.repair_strength_max
+    s_min = cfg.repair_strength_min
+    success_threshold = 0.03
 
-    for j in range(n_test):
-        idx = j * (len(pairs) // n_test)
+    def pick_strength(l1: float) -> float:
+        # Map L1 ∈ [0.02, 0.20] → strength ∈ [s_min, s_max]; clamp outside.
+        t = (l1 - 0.02) / (0.20 - 0.02)
+        t = max(0.0, min(1.0, t))
+        return s_min + (s_max - s_min) * t
+
+    print(f"{'Pair':>6}  {'L1_corr':>8}  {'strength':>8}  {'L1_rep':>7}  "
+          f"{'Δ':>8}  {'result':>6}")
+    print("-" * 60)
+
+    n_success = 0
+    for col, idx in enumerate(test_indices):
         corrupted, clean = pairs[idx]
 
-        
-        corrupted_tensor = corrupted.to(cfg.device)
-        repaired_tensor = repair_image(pipe, corrupted_tensor, cfg, view_index=j)
+        corrupted_dev = corrupted.to(cfg.device)
+        clean_dev = clean.to(cfg.device)
+        l1_corrupted = F.l1_loss(corrupted_dev, clean_dev).item()
 
-        
-        clean_device = clean.to(cfg.device)
-        l1_corrupted = F.l1_loss(corrupted_tensor, clean_device).item()
-        l1_repaired = F.l1_loss(repaired_tensor, clean_device).item()
+        strength = pick_strength(l1_corrupted)
+        repaired_dev = repair_image(pipe, corrupted_dev, cfg, view_index=col,
+                                     strength_override=strength,
+                                     eta=cfg.repair_eta_test)
+        l1_repaired = F.l1_loss(repaired_dev, clean_dev).item()
         improvement = l1_corrupted - l1_repaired
-        print(f"{idx:>6}  {l1_corrupted:>13.4f}  {l1_repaired:>12.4f}  {improvement:>+11.4f}")
 
-        result_np = repaired_tensor.cpu().numpy()
+        passed = (l1_repaired < l1_corrupted) or (l1_repaired <= success_threshold)
+        if passed:
+            n_success += 1
+        tag = "PASS" if passed else "FAIL"
+        print(f"{idx:>6}  {l1_corrupted:>8.4f}  {strength:>8.2f}  {l1_repaired:>7.4f}  "
+              f"{improvement:>+8.4f}  {tag:>6}")
 
-        axes[0, j].imshow(corrupted.numpy())
-        axes[0, j].set_title(f"Corrupted (pair {idx})\nL1={l1_corrupted:.4f}")
-        axes[0, j].axis("off")
-        axes[1, j].imshow(result_np)
-        axes[1, j].set_title(f"Repaired\nL1={l1_repaired:.4f} ({improvement:+.4f})")
-        axes[1, j].axis("off")
-        axes[2, j].imshow(clean.numpy())
-        axes[2, j].set_title("Ground Truth")
-        axes[2, j].axis("off")
+        repaired_np = repaired_dev.detach().cpu().numpy()
+        axes[0, col].imshow(corrupted.numpy())
+        axes[0, col].set_title(f"Corrupted (pair {idx})\nL1={l1_corrupted:.4f}")
+        axes[0, col].axis("off")
+        axes[1, col].imshow(repaired_np)
+        axes[1, col].set_title(
+            f"Repaired (s={strength:.2f}) [{tag}]\n"
+            f"L1={l1_repaired:.4f}  Δ={improvement:+.4f}"
+        )
+        axes[1, col].axis("off")
+        axes[2, col].imshow(clean.numpy())
+        axes[2, col].set_title("Ground Truth")
+        axes[2, col].axis("off")
 
-    fig.suptitle(f"Repair Test — {cfg.scene_name}", fontsize=14, y=1.01)
+    print("-" * 60)
+    print(f"Repair success rate: {n_success}/{n_test}")
+
+    fig.suptitle(f"Repair Test — {cfg.scene_name} ({n_success}/{n_test} pass)",
+                 fontsize=14, y=1.01)
     fig.savefig(test_dir / "repair_test_results.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
 

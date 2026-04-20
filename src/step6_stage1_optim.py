@@ -45,7 +45,7 @@ def load_repair_pipeline(cfg: RI3DConfig):
     from diffusers import (
         StableDiffusionControlNetImg2ImgPipeline,
         ControlNetModel,
-        DPMSolverMultistepScheduler,
+        DDIMScheduler,
     )
 
     model_dir = cfg.scene_output_dir() / "repair_model"
@@ -59,8 +59,9 @@ def load_repair_pipeline(cfg: RI3DConfig):
         cfg.sd_model, controlnet=controlnet, torch_dtype=dtype,
     ).to(device)
 
-    pipe.scheduler = DPMSolverMultistepScheduler.from_config(
-        pipe.scheduler.config, use_karras_sigmas=True)
+    # GaussianObject uses DDIM with eta=1.0 (stochastic). The eta is passed
+    # through the pipe call below, not on the scheduler config.
+    pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
     pipe.safety_checker = None
 
     return pipe
@@ -68,7 +69,8 @@ def load_repair_pipeline(cfg: RI3DConfig):
 
 def repair_image(pipe, image_tensor: torch.Tensor, cfg: RI3DConfig,
                  view_index: int = 0,
-                 strength_override: float | None = None) -> torch.Tensor:
+                 strength_override: float | None = None,
+                 eta: float | None = None) -> torch.Tensor:
     """Run repair model on a rendered image.
 
     Args:
@@ -97,17 +99,20 @@ def repair_image(pipe, image_tensor: torch.Tensor, cfg: RI3DConfig,
     generator = torch.Generator(device=cfg.device).manual_seed(42 + view_index)
 
     strength = strength_override if strength_override is not None else cfg.repair_strength
+    eta_val = eta if eta is not None else cfg.repair_eta_optim
 
+    # CFG=1.0 (GaussianObject convention) — negative prompt would be ignored,
+    # so we don't pass it; saves a text-encoder forward.
     with torch.no_grad():
         result = pipe(
             prompt=cfg.repair_positive_prompt,
-            negative_prompt=cfg.repair_negative_prompt,
             image=img_resized,
             control_image=img_resized,
             strength=strength,
             num_inference_steps=cfg.repair_inference_steps,
             guidance_scale=cfg.repair_guidance_scale,
             controlnet_conditioning_scale=cfg.repair_controlnet_scale,
+            eta=eta_val,
             generator=generator,
         ).images[0]
 
@@ -213,8 +218,8 @@ def run_stage1(cfg: RI3DConfig):
     
     
     
-    s_max = cfg.repair_strength_max  
-    s_min = cfg.repair_strength_min  
+    s_max = cfg.stage1_repair_strength_max
+    s_min = cfg.stage1_repair_strength_min
 
     print(f"\n=== Stage 1 Optimization ===")
     print(f"Input views: {n_images}, Novel views: {cfg.stage1_num_novel_views}")

@@ -297,8 +297,8 @@ def run_stage2(cfg: RI3DConfig):
 
     
     
-    s2_max = cfg.repair_strength  
-    s2_min = cfg.repair_strength_min  
+    s2_max = cfg.stage2_repair_strength_max
+    s2_min = cfg.stage2_repair_strength_min
 
     print(f"\n=== Stage 2 Optimization ===")
     print(f"Max iters: {cfg.stage2_max_iters}")
