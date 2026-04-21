@@ -499,22 +499,32 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
         lr_scheduler.step()
 
         iter_count += actual_bs
-        # Defer .item() — store loss tensor on GPU, only sync at print time.
-        losses.append(loss.detach())
+        # Log the UNWEIGHTED per-sample MSE — it's the actual ε-prediction
+        # quality and stable across timesteps. The Min-SNR-γ w(t) swings ~200×
+        # per step just from the random t draw, so plotting the weighted loss
+        # hides convergence under sampling noise. Keep w(t) for backward only.
+        losses.append(per_sample_mse.mean().detach())
         if iter_count % 100 < batch_size or step == n_steps - 1:
             recent_t = torch.stack(losses[-max(1, 100 // batch_size):]).float()
             avg_loss = recent_t.mean().item()
-            print(f"  Step ~{min(iter_count, n_iters)}: loss = {avg_loss:.6f}")
+            print(f"  Step ~{min(iter_count, n_iters)}: mse = {avg_loss:.6f}")
 
     controlnet.save_pretrained(model_dir / "controlnet")
     print(f"Saved repair model (full ControlNet) to {model_dir}")
 
-    losses_cpu = torch.stack(losses).float().cpu().numpy() if losses else []
+    losses_cpu = torch.stack(losses).float().cpu().numpy() if losses else np.array([])
     fig, ax = plt.subplots(figsize=(10, 4))
-    ax.plot(losses_cpu)
+    ax.plot(losses_cpu, alpha=0.3, label="per-step MSE")
+    if len(losses_cpu) >= 10:
+        win = max(10, len(losses_cpu) // 50)
+        kernel = np.ones(win) / win
+        rolling = np.convolve(losses_cpu, kernel, mode="valid")
+        ax.plot(np.arange(win - 1, len(losses_cpu)), rolling,
+                color="C1", linewidth=2, label=f"rolling mean (w={win})")
     ax.set_xlabel("Step")
-    ax.set_ylabel("Loss")
+    ax.set_ylabel("Unweighted ε-MSE")
     ax.set_title(f"Repair Model Training Loss — {cfg.scene_name}")
+    ax.legend()
     fig.savefig(model_dir / "training_loss.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
 

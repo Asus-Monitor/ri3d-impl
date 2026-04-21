@@ -44,7 +44,7 @@ class RI3DConfig:
     # Repair model (full ControlNet fine-tune, DPM++ scheduler, img2img pipeline)
     sd_model: str = "stable-diffusion-v1-5/stable-diffusion-v1-5"
     controlnet_model: str = "lllyasviel/control_v11f1e_sd15_tile"
-    repair_train_iters: int = 900
+    repair_train_iters: int = 2500
     repair_lr: float = 1e-4  # full FT — between LoRA's 1e-3 and the over-conservative 1e-5
     repair_inference_steps: int = 50  # DDIM steps per GaussianObject
     repair_guidance_scale: float = 1.0  # CFG off — trust the ControlNet (GaussianObject convention)
