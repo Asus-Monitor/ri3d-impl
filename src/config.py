@@ -45,12 +45,22 @@ class RI3DConfig:
     sd_model: str = "stable-diffusion-v1-5/stable-diffusion-v1-5"
     controlnet_model: str = "lllyasviel/control_v11f1e_sd15_tile"
     repair_train_iters: int = 1800
-    repair_lr: float = 5e-5  # full FT — between LoRA's 1e-3 and the over-conservative 1e-5
+    repair_lr: float = 1e-4  # full FT ControlNet; 5e-5 was conservative and slowed convergence
     repair_inference_steps: int = 50  # DDIM steps per GaussianObject
     repair_guidance_scale: float = 1.0  # CFG off — trust the ControlNet (GaussianObject convention)
     repair_controlnet_scale: float = 1.0  # GaussianObject default; >1.0 over-fits to corrupted render
     repair_hflip_augment: bool = True
     repair_image_loss_weight: float = 0.0  # disabled: VAE.decode backward is too expensive on 7.6 GB
+
+    # Pair filtering + mask-weighted loss. Mean L1 is dominated by clean
+    # background pixels even in heavily-corrupted pairs, so:
+    #   1) drop pairs whose artifact regions cover too little of the image
+    #      (frac_signif < threshold) — these teach identity, not repair
+    #   2) weight per-latent-pixel ε MSE by the artifact mask so gradient
+    #      concentrates on regions that actually need repair
+    repair_mask_diff_threshold: float = 0.05    # |diff| px-level "is artifact"
+    repair_pair_min_frac_signif: float = 0.15   # drop pairs below this artifact coverage
+    repair_mask_weight_background: float = 0.2  # latent loss weight for non-artifact px
     repair_strength: float = 0.6  # default img2img denoise strength (used by test)
     repair_strength_max: float = 1.0  # test/eval: full denoise to showcase repair power
     repair_strength_min: float = 0.1  # test/eval: minimal denoise on clean inputs
