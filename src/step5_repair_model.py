@@ -81,9 +81,24 @@ def generate_leave_one_out_data(cfg: RI3DConfig):
     
     
     
-    snapshot_steps = set(
-        range(cfg.loo_initial_iters, cfg.loo_total_iters, cfg.loo_snapshot_interval)
-    )
+    # Non-uniform snapshot schedule: 60% heavy-corruption + 40% light.
+    # Heavy snapshots are concentrated in the first ~1300 iters after the
+    # left-out view is re-added — long enough for Gaussians to densify into
+    # the view's novel regions (avoiding pure black OOD backgrounds) but
+    # before the floater/noise artifacts have resolved. Light snapshots
+    # sample the later, near-converged tail sparsely.
+    _re_add = cfg.loo_initial_iters
+    # Snapshots start just after the 20-iter left-out warmup (see training
+    # loop): by then Gaussians have begun densifying into the novel region
+    # (see densify_stop extension above) but are still floater-heavy.
+    heavy_start = _re_add + 40      # earliest: just after 35-iter warmup completes
+    heavy_end = _re_add + 1000      # end of "heavy" window (fast convergence phase)
+    light_start = heavy_end + 200
+    light_end = cfg.loo_total_iters
+    n_heavy, n_light = 12, 8        # 12 / 20 = 60%, 8 / 20 = 40%
+    heavy_steps = np.linspace(heavy_start, heavy_end, n_heavy, endpoint=False).astype(int).tolist()
+    light_steps = np.linspace(light_start, light_end, n_light, endpoint=False).astype(int).tolist()
+    snapshot_steps = set(heavy_steps + light_steps)
 
     all_indices = list(range(n_images))
 
@@ -117,15 +132,29 @@ def generate_leave_one_out_data(cfg: RI3DConfig):
         optimizers = model.setup_optimizers(cfg)
         from utils import compute_scene_scale
         loo_scene_scale = compute_scene_scale(poses)
+        # Extend densification past the re-add boundary so new Gaussians can
+        # form in the left-out view's novel regions during early post-re-add
+        # iters. Without this, densify is off by step 6000 and those regions
+        # render as black for hundreds of iters. Restored after strategy setup.
+        _orig_densify_stop = cfg.densify_stop
+        cfg.densify_stop = max(cfg.densify_stop, cfg.loo_initial_iters + 800)
         strategy, strategy_state = model.setup_strategy(cfg, scene_scale=loo_scene_scale)
+        cfg.densify_stop = _orig_densify_stop
 
         w2c_lo = w2c_all[left_out_idx]
         K_lo = K_all[left_out_idx]
 
+        # Force the first _loo_warmup_iters post-re-add iters to train on
+        # the left-out view itself, so new Gaussians densify into its novel
+        # regions before any snapshot is taken.
+        _loo_warmup_iters = 35
+
         for step in tqdm(range(cfg.loo_total_iters), desc=f"  LOO {left_out_idx}"):
-            
+
             if step < cfg.loo_initial_iters:
                 idx = train_indices[step % len(train_indices)]
+            elif step < cfg.loo_initial_iters + _loo_warmup_iters:
+                idx = left_out_idx
             else:
                 idx = all_indices[step % n_images]
 
@@ -154,25 +183,7 @@ def generate_leave_one_out_data(cfg: RI3DConfig):
 
     print(f"\nGenerated {len(all_pairs)} training pairs for scene {cfg.scene_name}")
     torch.save(all_pairs, data_dir / "training_pairs.pt")
-
-    
-    n_show = min(8, len(all_pairs))
-    if n_show > 0:
-        preview_indices = [int(i * len(all_pairs) / n_show) for i in range(n_show)]
-        fig, axes = plt.subplots(2, n_show, figsize=(4 * n_show, 8))
-        if n_show == 1:
-            axes = axes.reshape(-1, 1)
-        for col, j in enumerate(preview_indices):
-            axes[0, col].imshow(all_pairs[j][0].numpy())
-            axes[0, col].set_title(f"Corrupted (pair {j})")
-            axes[0, col].axis("off")
-            axes[1, col].imshow(all_pairs[j][1].numpy())
-            axes[1, col].set_title(f"Clean (pair {j})")
-            axes[1, col].axis("off")
-        fig.suptitle(f"Leave-One-Out Pairs — {cfg.scene_name} ({len(all_pairs)} total)")
-        fig.savefig(data_dir / "pairs_preview.png", dpi=120, bbox_inches="tight")
-        plt.close(fig)
-
+    # Preview images are produced on-demand by src/extract_pairs.py.
     return all_pairs
 
 
@@ -357,6 +368,16 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
                                                   torch_dtype=dtype, use_safetensors=False).to(device)
     controlnet.requires_grad_(True)
     controlnet.enable_gradient_checkpointing()
+    # xformers memory-efficient attention on both trained and frozen nets.
+    # Crucial for fitting full ControlNet FT on a 7.6 GiB GPU. Guarded so
+    # setups without xformers still run.
+    try:
+        import xformers  # noqa: F401
+        controlnet.enable_xformers_memory_efficient_attention()
+        unet.enable_xformers_memory_efficient_attention()
+        print("xformers memory-efficient attention: enabled")
+    except (ImportError, ModuleNotFoundError, AttributeError, Exception) as e:
+        print(f"xformers not available ({type(e).__name__}); using default attention")
     # Channels-last NHWC layout: ~8% faster on Turing+ conv kernels, no
     # change to training math (just memory layout). Apply to both the trained
     # ControlNet and the frozen UNet that backprop flows through.
@@ -374,6 +395,11 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
 
     n_iters = cfg.repair_train_iters
     max_t = noise_scheduler.config.num_train_timesteps
+    # Min-SNR-γ weighting (Hang et al. 2023). SD 1.5 is ε-prediction, so the
+    # per-sample weight is min(SNR(t), γ) / SNR(t). Precompute alphas_cumprod
+    # on-device; index by timestep in the training loop.
+    alphas_cumprod_dev = noise_scheduler.alphas_cumprod.to(device=device, dtype=torch.float32)
+    snr_gamma = float(cfg.repair_snr_gamma)
 
     # bs=1 on 8 GB Turing — bs=2 risks OOM when other processes share the
     # card (we measured 4.9 GB peak in isolation, but neighbors can take 2 GB+).
@@ -455,8 +481,14 @@ def train_repair_model(cfg: RI3DConfig, shared_components=None):
             mid_block_additional_residual=controlnet_output[1],
         ).sample
 
-        # Standard ε-prediction MSE loss (paper Sec 4.2 / GaussianObject).
-        loss = F.mse_loss(noise_pred.float(), noise_b.float())
+        # Min-SNR-γ weighted ε-prediction loss. Per-sample weight
+        # w(t) = min(SNR(t), γ) / SNR(t) rebalances mid/low-t (structure)
+        # against high-t (pure noise) samples for faster convergence.
+        ac = alphas_cumprod_dev[t_b]                       # [B]
+        snr = ac / (1.0 - ac).clamp_min(1e-8)              # [B]
+        w = torch.clamp(snr, max=snr_gamma) / snr          # [B]
+        per_sample_mse = (noise_pred.float() - noise_b.float()).pow(2).mean(dim=[1, 2, 3])
+        loss = (w * per_sample_mse).mean()
         loss.backward()
         # Speed: clip but DO NOT call .isfinite() — the boolean check forces a
         # GPU↔CPU sync every step. Warmup keeps loss stable early; if NaN
@@ -501,12 +533,14 @@ def _prepare_for_pipeline(image: Image.Image, target_short_side: int = 512) -> t
 def test_repair_model(cfg: RI3DConfig):
     """Test the trained repair model using the same pipeline as Stage 1.
 
-    Uses adaptive strength based on initial corruption severity (matching the
-    Stage 1 schedule from cfg.repair_strength_max → cfg.repair_strength_min).
-    Reports PASS/FAIL per pair: success if L1_repaired < L1_corrupted OR
-    L1_repaired <= 0.03.
+    Uses adaptive strength based on initial perceptual corruption severity
+    (LPIPS). Reports PASS/FAIL per pair: success if LPIPS_repaired <
+    LPIPS_corrupted OR LPIPS_repaired <= cfg.repair_test_lpips_success.
+    LPIPS (lower = better) reflects perceptual repair quality; L1 can be
+    gamed by blur regressing to the mean.
     """
     from step6_stage1_optim import load_repair_pipeline, repair_image
+    from gaussian_trainer import LPIPSLoss
 
     out_dir = cfg.scene_output_dir()
     test_dir = out_dir / "repair_test"
@@ -520,10 +554,19 @@ def test_repair_model(cfg: RI3DConfig):
 
     print("Loading repair pipeline for test...")
     pipe = load_repair_pipeline(cfg)
+    lpips_fn = LPIPSLoss(device=cfg.device)
 
+    # Rank pairs by LPIPS and test across the perceptual spectrum, biased
+    # toward the heavy-corruption tail (the regime that's failing).
+    with torch.no_grad():
+        all_lpips = []
+        for corrupted, clean in pairs:
+            all_lpips.append(lpips_fn(corrupted.to(cfg.device), clean.to(cfg.device)).item())
+    order = sorted(range(len(pairs)), key=lambda i: all_lpips[i])
     n_test = min(6, len(pairs))
-    # Sample evenly across pairs (mix of heavy/light corruption).
-    test_indices = [int(i * (len(pairs) - 1) / max(n_test - 1, 1)) for i in range(n_test)]
+    # Quantile picks across sorted order → always includes easiest, hardest.
+    test_indices = [order[int(i * (len(order) - 1) / max(n_test - 1, 1))]
+                    for i in range(n_test)]
 
     fig, axes = plt.subplots(3, n_test, figsize=(5 * n_test, 15))
     if n_test == 1:
@@ -531,63 +574,69 @@ def test_repair_model(cfg: RI3DConfig):
 
     s_max = cfg.repair_strength_max
     s_min = cfg.repair_strength_min
-    success_threshold = 0.03
+    success_threshold = cfg.repair_test_lpips_success
 
-    def pick_strength(l1: float) -> float:
-        # Map L1 ∈ [0.02, 0.20] → strength ∈ [s_min, s_max]; clamp outside.
-        t = (l1 - 0.02) / (0.20 - 0.02)
+    def pick_strength(lp: float) -> float:
+        # Map LPIPS ∈ [0.05, 0.40] → strength ∈ [s_min, s_max]; clamp outside.
+        t = (lp - 0.05) / (0.40 - 0.05)
         t = max(0.0, min(1.0, t))
         return s_min + (s_max - s_min) * t
 
-    print(f"{'Pair':>6}  {'L1_corr':>8}  {'strength':>8}  {'L1_rep':>7}  "
+    print(f"{'Pair':>6}  {'LP_corr':>8}  {'strength':>8}  {'LP_rep':>7}  "
           f"{'Δ':>8}  {'result':>6}")
     print("-" * 60)
 
     n_success = 0
+    per_pair = []
     for col, idx in enumerate(test_indices):
         corrupted, clean = pairs[idx]
 
         corrupted_dev = corrupted.to(cfg.device)
         clean_dev = clean.to(cfg.device)
-        l1_corrupted = F.l1_loss(corrupted_dev, clean_dev).item()
+        lp_corrupted = lpips_fn(corrupted_dev, clean_dev).item()
 
-        strength = pick_strength(l1_corrupted)
+        strength = pick_strength(lp_corrupted)
         repaired_dev = repair_image(pipe, corrupted_dev, cfg, view_index=col,
                                      strength_override=strength,
                                      eta=cfg.repair_eta_test)
-        l1_repaired = F.l1_loss(repaired_dev, clean_dev).item()
-        improvement = l1_corrupted - l1_repaired
+        lp_repaired = lpips_fn(repaired_dev, clean_dev).item()
+        improvement = lp_corrupted - lp_repaired
 
-        passed = (l1_repaired < l1_corrupted) or (l1_repaired <= success_threshold)
+        passed = (lp_repaired < lp_corrupted) or (lp_repaired <= success_threshold)
         if passed:
             n_success += 1
         tag = "PASS" if passed else "FAIL"
-        print(f"{idx:>6}  {l1_corrupted:>8.4f}  {strength:>8.2f}  {l1_repaired:>7.4f}  "
+        print(f"{idx:>6}  {lp_corrupted:>8.4f}  {strength:>8.2f}  {lp_repaired:>7.4f}  "
               f"{improvement:>+8.4f}  {tag:>6}")
+        per_pair.append((idx, lp_corrupted, lp_repaired))
 
         repaired_np = repaired_dev.detach().cpu().numpy()
         axes[0, col].imshow(corrupted.numpy())
-        axes[0, col].set_title(f"Corrupted (pair {idx})\nL1={l1_corrupted:.4f}")
+        axes[0, col].set_title(f"Corrupted (pair {idx})\nLPIPS={lp_corrupted:.4f}")
         axes[0, col].axis("off")
         axes[1, col].imshow(repaired_np)
         axes[1, col].set_title(
             f"Repaired (s={strength:.2f}) [{tag}]\n"
-            f"L1={l1_repaired:.4f}  Δ={improvement:+.4f}"
+            f"LPIPS={lp_repaired:.4f}  Δ={improvement:+.4f}"
         )
         axes[1, col].axis("off")
         axes[2, col].imshow(clean.numpy())
         axes[2, col].set_title("Ground Truth")
         axes[2, col].axis("off")
 
+    mean_lp_rep = sum(p[2] for p in per_pair) / max(len(per_pair), 1)
     print("-" * 60)
-    print(f"Repair success rate: {n_success}/{n_test}")
+    print(f"Repair success rate: {n_success}/{n_test}  |  mean LPIPS_rep = {mean_lp_rep:.4f}")
+    torch.save({"per_pair": per_pair, "mean_lpips_repaired": mean_lp_rep,
+                "n_success": n_success, "n_test": n_test},
+               test_dir / "test_metrics.pt")
 
-    fig.suptitle(f"Repair Test — {cfg.scene_name} ({n_success}/{n_test} pass)",
+    fig.suptitle(f"Repair Test — {cfg.scene_name} ({n_success}/{n_test} pass, LPIPS)",
                  fontsize=14, y=1.01)
     fig.savefig(test_dir / "repair_test_results.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
 
-    del pipe
+    del pipe, lpips_fn
     torch.cuda.empty_cache()
     print(f"Saved repair test results to {test_dir}")
 

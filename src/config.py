@@ -44,12 +44,14 @@ class RI3DConfig:
     # Repair model (full ControlNet fine-tune, DPM++ scheduler, img2img pipeline)
     sd_model: str = "stable-diffusion-v1-5/stable-diffusion-v1-5"
     controlnet_model: str = "lllyasviel/control_v11f1e_sd15_tile"
-    repair_train_iters: int = 1800
-    repair_lr: float = 5e-5  # full FT — between LoRA's 1e-3 and the over-conservative 1e-5
+    repair_train_iters: int = 900
+    repair_lr: float = 1e-4  # full FT — between LoRA's 1e-3 and the over-conservative 1e-5
     repair_inference_steps: int = 50  # DDIM steps per GaussianObject
     repair_guidance_scale: float = 1.0  # CFG off — trust the ControlNet (GaussianObject convention)
     repair_controlnet_scale: float = 1.0  # GaussianObject default; >1.0 over-fits to corrupted render
     repair_hflip_augment: bool = True
+    repair_snr_gamma: float = 5.0  # Min-SNR-γ weighting; ε-pred form: min(snr, γ)/snr
+    repair_test_lpips_success: float = 0.10  # test PASS if LPIPS_repaired <= this
     repair_image_loss_weight: float = 0.0  # disabled: VAE.decode backward is too expensive on 7.6 GB
     repair_strength: float = 0.6  # default img2img denoise strength (used by test)
     repair_strength_max: float = 1.0  # test/eval: full denoise to showcase repair power

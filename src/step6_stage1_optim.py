@@ -64,6 +64,12 @@ def load_repair_pipeline(cfg: RI3DConfig):
     pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
     pipe.safety_checker = None
 
+    try:
+        import xformers  # noqa: F401
+        pipe.enable_xformers_memory_efficient_attention()
+    except (ImportError, ModuleNotFoundError, AttributeError, Exception):
+        pass
+
     return pipe
 
 
