@@ -334,13 +334,33 @@ def init_gaussians(cfg: RI3DConfig):
     quats[:, 0] = 1.0  # identity rotation (wxyz)
     opacities = torch.full((n_total,), cfg.gaussian_init_opacity)
 
+    # Convert RGB to SH DC coefficients. Paper §3.1: "color c represented with
+    # spherical harmonics (SH) coefficients". Without SH, a Gaussian has one
+    # fixed RGB regardless of viewing direction — multiple Gaussians from
+    # different input views overlap at novel angles and blend incoherently,
+    # producing "colored splat blobs" that are OOD for the repair model (real
+    # 3DGS never renders like that). With SH degree 3, each Gaussian has 16
+    # coefficients per channel; DC (index 0) encodes the base color and higher
+    # orders encode view-dependent residuals learned during optimization.
+    #
+    # Gsplat renders: rendered_color = C0 * DC + 0.5 + higher_terms (see
+    # gsplat.exporter.sh2rgb). Init DC so view-independent render == RGB:
+    #   DC = (RGB - 0.5) / C0. We derive C0 from sh2rgb to stay in sync with
+    # gsplat's convention.
+    from gsplat.exporter import sh2rgb
+    SH_C0 = float(sh2rgb(torch.tensor(1.0)) - sh2rgb(torch.tensor(0.0)))
+    SH_DEGREE = 3
+    K_coefs = (SH_DEGREE + 1) ** 2  # = 16 for degree 3
+    sh_coefs = torch.zeros(n_total, K_coefs, 3)
+    sh_coefs[:, 0, :] = (colors - 0.5) / SH_C0
+
     # Store in log/logit space for optimization
     gaussians = {
         "means": means,
         "scales": torch.log(scales.clamp(min=1e-8)),  # log-space
         "quats": quats,
         "opacities": torch.logit(opacities.clamp(1e-4, 1 - 1e-4)),  # logit-space
-        "colors": colors,
+        "colors": sh_coefs,  # (N, 16, 3) SH coefficients, not raw RGB
     }
 
     # Save
@@ -390,7 +410,7 @@ def render_initial_views(cfg: RI3DConfig):
                 means=means, quats=quats, scales=scales,
                 opacities=opacities, colors=colors,
                 viewmats=w2c, Ks=K, width=W, height=H,
-                sh_degree=None, packed=True,
+                sh_degree=3, packed=True,
                 near_plane=0.01, far_plane=1000.0,
             )
 
@@ -441,7 +461,7 @@ def render_initial_views(cfg: RI3DConfig):
                 means=means, quats=quats, scales=scales,
                 opacities=opacities, colors=colors,
                 viewmats=w2c, Ks=K, width=W, height=H,
-                sh_degree=None, packed=True,
+                sh_degree=3, packed=True,
                 near_plane=0.01, far_plane=1000.0,
             )
 

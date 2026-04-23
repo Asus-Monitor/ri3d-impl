@@ -1,15 +1,21 @@
 """Step 8: Stage 2 Optimization — inpaint missing regions and finalize.
 
-Per the paper (Sec 4.3, Stage 2):
-  1. Select K non-overlapping novel views with missing regions
-  2. Inpaint missing areas using personalized inpainting model
-  3. Project inpainted content into 3D using monocular depth + alignment
-  4. Continue optimization with repair model on all novel views
-  5. Repeat inpaint-optimize cycle until missing areas are filled
+Per the paper (Sec 4.3, Eq. 4) — refreshed every 200 iters (§8.3):
+  1. Render all M novel views
+  2. Select K non-overlapping novel views with missing regions (inpaint
+     until step < stage2_inpaint_cutoff)
+  3. Inpaint missing areas via personalized inpainting model
+  4. Project inpainted content into 3D (Poisson-fused mono-depth)
+  5. Repair all M views to produce pseudo-GTs
+  6. Optimize for stage2_inpaint_interval iters with loss below
 
-Loss_stage2 = sum_i L_rec(rendered_i, gt_i)
-            + sum_j λ_j L_rec(rendered_j, repaired_j)      [no visibility mask]
-            + sum_k (1-M_α_k) ⊙ M_b_k ⊙ Lp(rendered_k, inpainted_k)
+  L = sum_i L_rec(rendered_i, gt_i)                        [input views]
+    + sum_j λ_j L_rec(rendered_j, repaired_j)              [full image, no M_α]
+    + sum_k (1-M_α_k) ⊙ M_b_k ⊙ Lp(rendered_k, inpainted_k) [live M_α]
+
+The live M_α on term 3 is the anti-ratchet: as 3DGS fills in a missing
+region, the inpaint supervision naturally deactivates there and term 2
+(repair) smoothly takes over for final consistency.
 
 Outputs:
   - outputs/<scene>/stage2_checkpoint.pt   final 3DGS checkpoint
@@ -122,7 +128,7 @@ def inpaint_missing_regions(pipe, rendered_image: torch.Tensor,
 def project_inpainted_to_3d(inpainted_image: torch.Tensor, missing_mask: torch.Tensor,
                               rendered_depth: torch.Tensor, c2w: torch.Tensor,
                               K: torch.Tensor, cfg: RI3DConfig,
-                              max_new_gaussians: int = 3000) -> dict | None:
+                              max_new_gaussians: int = 1000) -> dict | None:
     """Project inpainted pixels into 3D as new Gaussians.
 
     Per paper Sec 4.3 Stage 2: "We address this by combining the monocular
@@ -130,7 +136,10 @@ def project_inpainted_to_3d(inpainted_image: torch.Tensor, missing_mask: torch.T
     Uses Poisson fusion (same as step3) with rendered depth as reference
     and visibility mask as the confidence mask.
 
-    Subsamples to max_new_gaussians to prevent unbounded growth.
+    Subsamples to max_new_gaussians to prevent unbounded growth. With 14
+    inpaint cycles × 5 views, 1000/view caps total inpaint Gaussians at ~70k —
+    enough to cover missing regions without superimposing contradictory
+    hallucinations from successive cycles.
     """
     from step3_depth_fusion import align_mono_to_dust3r, solve_poisson_fusion_fast
 
@@ -200,12 +209,21 @@ def project_inpainted_to_3d(inpainted_image: torch.Tensor, missing_mask: torch.T
     quats[:, 0] = 1.0
     opacities = torch.full((n,), 0.5, device=device)
 
+    # Convert inpainted RGB to SH DC coefficients (must match existing
+    # Gaussians' shape (N, 16, 3) so extend_with_gaussians can concatenate).
+    # See step4 for convention: DC = (RGB - 0.5) / C0, higher orders = 0.
+    from gsplat.exporter import sh2rgb
+    SH_C0 = float(sh2rgb(torch.tensor(1.0)) - sh2rgb(torch.tensor(0.0)))
+    K_coefs = 16  # (sh_degree=3 + 1)^2
+    sh_coefs = torch.zeros(n, K_coefs, 3, device=device)
+    sh_coefs[:, 0, :] = (colors - 0.5) / SH_C0
+
     return {
         "means": pts,
         "scales": torch.log(scales.clamp(min=1e-8)),
         "quats": quats,
         "opacities": torch.logit(opacities.clamp(1e-4, 1 - 1e-4)),
-        "colors": colors,
+        "colors": sh_coefs,
     }
 
 
@@ -286,11 +304,14 @@ def run_stage2(cfg: RI3DConfig):
     inpaint_pipe = None
     repair_pipe = None
 
-    
+
     pseudo_gt = [None] * cfg.stage2_num_novel_views
     inpainted_images = [None] * cfg.stage2_num_novel_views
+    # M_b cached per-refresh (from mono-depth of the current repaired image,
+    # same as stage 1). M_α is recomputed live per-step for the inpaint term
+    # (paper Eq. 4, term 3 uses current opacity); term 2 has no M_α in stage 2.
     cached_bg_masks = [None] * cfg.stage2_num_novel_views
-    inpaint_cycle = 0  
+    inpaint_cycle = 0
 
     plateau = PlateauDetector(cfg.plateau_window, cfg.plateau_threshold, cfg.plateau_min_iters)
     losses_history = []
@@ -313,7 +334,6 @@ def run_stage2(cfg: RI3DConfig):
             print(f"\n  Refresh cycle at step {step}...")
 
             with torch.no_grad():
-                
                 renders_cache = {}
                 for j in range(cfg.stage2_num_novel_views):
                     r = model.render(novel_w2c[j], K_avg, H, W, return_depth=True)
@@ -466,38 +486,41 @@ def run_stage2(cfg: RI3DConfig):
         
         
         
+        # Novel-view terms (Eq. 4): all M views with per-paper weights λ_j.
+        # Term 2 in stage 2 has NO M_α mask (paper: "we enforce the loss in
+        # the second term across the entire image by removing the visibility
+        # mask"). Term 3 uses LIVE M_α from current render.
         if pseudo_gt[0] is not None:
-            for nov_idx in range(cfg.stage2_num_novel_views):
+            n_nov = cfg.stage2_num_novel_views
+            for nov_idx in range(n_nov):
                 w2c_nov = novel_w2c[nov_idx]
 
                 result_nov = model.render_for_loss(w2c_nov, K_avg, H, W, render_mode="RGB")
                 lambda_j = camera_weights[nov_idx]
 
-                
-                
-                view_loss = (lambda_j / n_images) * reconstruction_loss(
+                view_loss = lambda_j * reconstruction_loss(
                     result_nov["image"], pseudo_gt[nov_idx],
                     ssim_fn, lpips_fn_or_none, cfg,
                 )
 
-                
-                
-                
-                
                 if inpainted_images[nov_idx] is not None and cached_bg_masks[nov_idx] is not None:
-                    alpha_mask_now = get_opacity_mask(result_nov["alpha"])
-                    mask_ip = (1 - alpha_mask_now) * cached_bg_masks[nov_idx]
+                    # Live M_α — as 3DGS fills in, the inpaint loss naturally
+                    # deactivates and term 2 (repair) takes over. This is the
+                    # paper's anti-ratchet in stage 2: supervision transitions
+                    # from "pull content into this hole" to "keep rendered
+                    # content consistent with the repaired image".
+                    alpha_mask_live = get_opacity_mask(result_nov["alpha"]).detach()
+                    mask_ip = (1 - alpha_mask_live) * cached_bg_masks[nov_idx]
                     if mask_ip.sum() > 100:
-                        mask_ip_3ch = mask_ip.unsqueeze(-1)  
+                        mask_ip_3ch = mask_ip.unsqueeze(-1)
                         n_ip_pixels = mask_ip.sum().clamp(min=1)
-                        
+
                         ip_l1 = ((result_nov["image"] - inpainted_images[nov_idx]).abs() * mask_ip_3ch).sum() / (n_ip_pixels * 3)
                         ip_loss = cfg.loss_l1_weight * ip_l1
-                        
-                        
+
                         if lpips_fn_or_none is not None:
                             lpips_map = lpips_fn(result_nov["image"], inpainted_images[nov_idx],
-                                                 return_map=True)  
+                                                 return_map=True)
                             if lpips_map.shape != mask_ip.shape:
                                 lpips_map = F.interpolate(
                                     lpips_map.unsqueeze(0).unsqueeze(0),

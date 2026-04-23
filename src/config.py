@@ -57,16 +57,26 @@ class RI3DConfig:
     repair_strength_max: float = 1.0  # test/eval: full denoise to showcase repair power
     repair_strength_min: float = 0.1  # test/eval: minimal denoise on clean inputs
 
-    # Optimization-time strengths are MUCH milder than test-time. Multi-refresh
-    # with high strength + stochastic DDIM compounds hallucination drift across
-    # refreshes; conservative caps + deterministic DDIM (see repair_eta below)
-    # let each refresh refine the previous result rather than reinvent it.
-    stage1_repair_strength_max: float = 0.6
-    stage1_repair_strength_min: float = 0.2
-    stage2_repair_strength_max: float = 0.4
-    stage2_repair_strength_min: float = 0.1
-    repair_eta_optim: float = 0.0  # deterministic DDIM during optimization
-    repair_eta_test: float = 1.0   # stochastic DDIM for isolated test (GaussianObject default)
+    # Per-refresh strength schedule: starts high (big corrections early when the
+    # render is rough), decays low (small corrections late when render is close
+    # to truth). Adaptive schedule supports the paper's iterative refresh: the
+    # anti-spiral mechanism is opacity reg + live M_α shrinking under it, not
+    # avoiding repeated repair calls.
+    stage1_repair_strength_max: float = 0.5
+    stage1_repair_strength_min: float = 0.1
+    stage2_repair_strength_max: float = 0.3
+    stage2_repair_strength_min: float = 0.05
+    # DDIM eta = 1.0 (stochastic) matches GaussianObject's recipe and the
+    # tested-passing configuration of `repair_test`. Deterministic (eta=0)
+    # was the hallucination-spiral root cause: with a fixed per-view seed,
+    # every refresh lands on the same local mode of the SD conditional — if
+    # that mode is slightly stylized, 3DGS absorbs it, next refresh repeats,
+    # stylization compounds. eta=1.0 samples from a broader posterior; the
+    # 3DGS projection averages across modes and lands closer to the natural-
+    # image manifold. The earlier rationale ("stochastic DDIM compounds
+    # drift") had the mechanism backwards.
+    repair_eta_optim: float = 1.0
+    repair_eta_test: float = 1.0
     # DreamBooth-style rare token + scene-name. The rare token forces the model
     # to bind scene-specific repair behavior to this identifier, instead of
     # diluting the generic "best quality" subspace.
@@ -94,7 +104,16 @@ class RI3DConfig:
     # Stage 1 optimization
     stage1_max_iters: int = 4000
     stage1_num_novel_views: int = 8
-    stage1_refresh_interval: int = 99999  # single-pass: only refresh at step 0, then 3DGS optimizes against fixed pseudo-GT
+    stage1_refresh_interval: int = 400  # paper §8.3: repaired views refreshed every 400 iters
+    # Warmup: train on inputs only first, so that when we render at novel views
+    # for the first repair call, the render is "mid-training 3DGS" style — the
+    # distribution the repair model was trained on (§4.2 trains on renders from
+    # 6000-10000 iter leave-one-out 3DGS). Step-0 renders from per-pixel init
+    # are OOD for the repair model; feeding them in produces hallucinated
+    # pseudo-GTs that anchor all subsequent optimization. Paper doesn't specify
+    # this because for them repair's training distribution and inference-step-0
+    # render distribution may have been close enough; for us they aren't.
+    stage1_warmup_iters: int = 1000
     stage1_lr_position: float = 1.6e-4
     stage1_lr_opacity: float = 0.05
     stage1_lr_scaling: float = 5e-3
@@ -105,7 +124,7 @@ class RI3DConfig:
     stage2_max_iters: int = 4000
     stage2_num_novel_views: int = 10
     stage2_num_inpaint_views: int = 5  # K views to inpaint per cycle
-    stage2_inpaint_interval: int = 99999  # single-pass: inpaint+repair once at step 0, then optimize against fixed targets
+    stage2_inpaint_interval: int = 200  # paper §8.3: sample & inpaint every 200 iters
     stage2_inpaint_cutoff: int = 2800  # stop inpainting after this iter, only repair
 
     # Loss weights
@@ -113,16 +132,23 @@ class RI3DConfig:
     loss_ssim_weight: float = 0.2
     loss_lpips_weight: float = 0.1
     loss_depth_corr_weight: float = 0.1
-    loss_opacity_reg_weight: float = 0.01
+    loss_opacity_reg_weight: float = 0.3  # anti-ratchet: with fixed capacity (no densification), this can now actually shrink alpha in background holes faster than repair inflates it
 
     # Plateau detection (replaces fixed iteration counts)
     plateau_window: int = 400      # match refresh interval so window spans a full cycle
     plateau_threshold: float = 5e-4  # min relative improvement to continue
     plateau_min_iters: int = 2000   # run at least half the max iters before allowing early stop
 
-    # 3DGS densification (scaled for 4000-iter optimization)
-    densify_start: int = 500
-    densify_stop: int = 2000
+    # 3DGS densification. Disabled by default: paper §4.1 initializes one
+    # Gaussian per pixel per input image (already ~500k for 3 images @ ~400x
+    # resolution). §8.3 specifies no densification schedule, and the whole
+    # point of the paper's dense init is that standard 3DGS densification —
+    # designed for sparse COLMAP points ~10k — becomes redundant capacity
+    # bloat. With 500k Gaussians already, aggressive densification lets the
+    # representation fit hallucinated pseudo-GTs perfectly, defeating the
+    # opacity reg anti-ratchet.
+    densify_start: int = 99999  # never (paper uses dense init as capacity budget)
+    densify_stop: int = 99999
     densify_interval: int = 100
     densify_grad_threshold: float = 0.0002
     densify_reset_every: int = 1000  # reset opacities to allow pruning
