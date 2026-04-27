@@ -113,7 +113,7 @@ class RI3DConfig:
     # pseudo-GTs that anchor all subsequent optimization. Paper doesn't specify
     # this because for them repair's training distribution and inference-step-0
     # render distribution may have been close enough; for us they aren't.
-    stage1_warmup_iters: int = 1000
+    stage1_warmup_iters: int = 100
     stage1_lr_position: float = 1.6e-4
     stage1_lr_opacity: float = 0.05
     stage1_lr_scaling: float = 5e-3
