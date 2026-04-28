@@ -81,23 +81,39 @@ def generate_leave_one_out_data(cfg: RI3DConfig):
     
     
     
-    # Non-uniform snapshot schedule: 60% heavy-corruption + 40% light.
-    # Heavy snapshots are concentrated in the first ~1300 iters after the
-    # left-out view is re-added — long enough for Gaussians to densify into
-    # the view's novel regions (avoiding pure black OOD backgrounds) but
-    # before the floater/noise artifacts have resolved. Light snapshots
-    # sample the later, near-converged tail sparsely.
+    # Three-phase snapshot schedule covering the full "progressively refined"
+    # range the paper §4.2 describes:
+    #
+    #   blob   (separate pre-loop pass, FULL per-pixel init — no strip):
+    #          held-out's own Gaussians stay in the model so its camera always
+    #          has coverage; the other N-1 views' Gaussians drift under their
+    #          own training, producing splat-blob misalignment at the held-out
+    #          camera. This is the distribution Stage 1 actually hits at its
+    #          first refresh.
+    #          NOTE: an earlier version stripped held-out's Gaussians here too
+    #          (matching the main loop's phase 1). That gave pure-black bgs in
+    #          regions only the held-out view covers — a missing-geometry
+    #          artifact, not a misalignment one, and Stage 1 never produces
+    #          black bgs because it has all N views' Gaussians.
+    #   heavy  (post-re-add, 0-1000 iters): floater/ghosting regime, stripped
+    #          model (existing main loop).
+    #   light  (post-re-add, 1200-end): near-converged tail, stripped model.
     _re_add = cfg.loo_initial_iters
-    # Snapshots start just after the 20-iter left-out warmup (see training
-    # loop): by then Gaussians have begun densifying into the novel region
-    # (see densify_stop extension above) but are still floater-heavy.
+    blob_steps = [50, 100, 250, 500, 1000, 2500]
+    blob_steps_set = set(blob_steps)
+    blob_max_iter = max(blob_steps) + 1
+    # Snapshots in the main LOO loop resume just after the 35-iter left-out
+    # warmup (see training loop): by then Gaussians have begun densifying into
+    # the novel region (see densify_stop extension below) but are still
+    # floater-heavy.
     heavy_start = _re_add + 40      # earliest: just after 35-iter warmup completes
     heavy_end = _re_add + 1000      # end of "heavy" window (fast convergence phase)
     light_start = heavy_end + 200
     light_end = cfg.loo_total_iters
-    n_heavy, n_light = 12, 8        # 12 / 20 = 60%, 8 / 20 = 40%
+    n_heavy, n_light = 12, 8
     heavy_steps = np.linspace(heavy_start, heavy_end, n_heavy, endpoint=False).astype(int).tolist()
     light_steps = np.linspace(light_start, light_end, n_light, endpoint=False).astype(int).tolist()
+    # blob_steps are NOT in this set — blob runs in its own pre-loop pass below.
     snapshot_steps = set(heavy_steps + light_steps)
 
     all_indices = list(range(n_images))
@@ -114,14 +130,53 @@ def generate_leave_one_out_data(cfg: RI3DConfig):
     for c in per_view_counts:
         per_view_offsets.append(per_view_offsets[-1] + c)
 
+    from utils import compute_scene_scale
+    loo_scene_scale = compute_scene_scale(poses)
+
     for left_out_idx in range(n_images):
         name = Path(image_paths[left_out_idx]).stem
         print(f"\nLeave-one-out: excluding view {left_out_idx} ({name})")
 
         train_indices = [j for j in range(n_images) if j != left_out_idx]
         clean_cpu = gt_images_render[left_out_idx]
+        w2c_lo = w2c_all[left_out_idx]
+        K_lo = K_all[left_out_idx]
 
-        
+        # === Blob phase (full init, no strip) ===
+        # Run a short auxiliary 3DGS optimization with the FULL per-pixel init
+        # (held-out's Gaussians kept). Train on N-1 views (held-out excluded
+        # from supervision). Held-out's own Gaussians get no gradient and stay
+        # at per-pixel init → they cover the held-out camera so renders never
+        # have black-bg holes. The other views' Gaussians drift under their
+        # own training, producing splat-blob misalignment at the held-out cam
+        # — the distribution Stage 1's first refresh sees.
+        blob_model = GaussianModel(gaussians_init, device)
+        blob_model.setup_optimizers(cfg)
+        blob_strategy, blob_strategy_state = blob_model.setup_strategy(
+            cfg, scene_scale=loo_scene_scale
+        )
+        for step in tqdm(range(blob_max_iter), desc=f"  Blob {left_out_idx}"):
+            idx = train_indices[step % len(train_indices)]
+            result = blob_model.render_for_optim(
+                w2c_all[idx], loo_K_all[idx], loo_H, loo_W,
+                blob_strategy, blob_strategy_state, step,
+                render_mode="RGB",
+            )
+            loss = F.l1_loss(result["image"], gt_gpu_loo[idx])
+            loss.backward()
+            blob_model.step_post_backward(step, result["meta"])
+            blob_model.optimizer_step()
+
+            if step in blob_steps_set:
+                with torch.no_grad():
+                    r = blob_model.render(w2c_lo, K_lo, H, W)
+                    corrupted = r["image"].clamp(0, 1).cpu()
+                    all_pairs.append((corrupted, clean_cpu))
+
+        del blob_model
+        torch.cuda.empty_cache()
+
+        # === Main LOO (heavy + light, stripped init — paper's leave-one-out) ===
         lo_start = per_view_offsets[left_out_idx]
         lo_end = per_view_offsets[left_out_idx + 1]
         loo_gaussians = {
@@ -130,8 +185,6 @@ def generate_leave_one_out_data(cfg: RI3DConfig):
         }
         model = GaussianModel(loo_gaussians, device)
         optimizers = model.setup_optimizers(cfg)
-        from utils import compute_scene_scale
-        loo_scene_scale = compute_scene_scale(poses)
         # Extend densification past the re-add boundary so new Gaussians can
         # form in the left-out view's novel regions during early post-re-add
         # iters. Without this, densify is off by step 6000 and those regions
@@ -140,9 +193,6 @@ def generate_leave_one_out_data(cfg: RI3DConfig):
         cfg.densify_stop = max(cfg.densify_stop, cfg.loo_initial_iters + 800)
         strategy, strategy_state = model.setup_strategy(cfg, scene_scale=loo_scene_scale)
         cfg.densify_stop = _orig_densify_stop
-
-        w2c_lo = w2c_all[left_out_idx]
-        K_lo = K_all[left_out_idx]
 
         # Force the first _loo_warmup_iters post-re-add iters to train on
         # the left-out view itself, so new Gaussians densify into its novel
