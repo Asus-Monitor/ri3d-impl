@@ -120,7 +120,7 @@ def repair_image(pipe, image_tensor: torch.Tensor, cfg: RI3DConfig,
     generator = torch.Generator(device=cfg.device).manual_seed(42)
 
     strength = strength_override if strength_override is not None else cfg.repair_strength
-    eta_val = eta if eta is not None else cfg.repair_eta_optim
+    eta_val = eta if eta is not None else cfg.repair_eta
 
     # CFG=1.0 (GaussianObject convention) — negative prompt would be ignored,
     # so we don't pass it; saves a text-encoder forward.

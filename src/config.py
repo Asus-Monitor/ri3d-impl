@@ -73,8 +73,7 @@ class RI3DConfig:
     # 3DGS projection averages across modes and lands closer to the natural-
     # image manifold. The earlier rationale ("stochastic DDIM compounds
     # drift") had the mechanism backwards.
-    repair_eta_optim: float = 1.0
-    repair_eta_test: float = 1.0
+    repair_eta: float = 1.0
     # DreamBooth-style rare token + scene-name. The rare token forces the model
     # to bind scene-specific repair behavior to this identifier, instead of
     # diluting the generic "best quality" subspace.

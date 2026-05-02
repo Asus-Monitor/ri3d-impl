@@ -38,7 +38,13 @@
       "Bash(du -sh /home/vy/ri3d-impl/output/*/)",
       "Bash(pip install *)",
       "Read(//home/vy/**)",
-      "Bash(nvidia-smi *)"
+      "Bash(nvidia-smi *)",
+      "Bash(cat)",
+      "Bash(/tmp/check_unused.sh)",
+      "Bash(sed -n '256,280p' src/step6_stage1_optim.py)",
+      "Bash(sed -n '330,360p' src/step8_stage2_optim.py)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)"
     ]
   }
 }

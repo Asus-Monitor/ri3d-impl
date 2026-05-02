@@ -658,7 +658,7 @@ def test_repair_model(cfg: RI3DConfig):
         strength = pick_strength(lp_corrupted)
         repaired_dev = repair_image(pipe, corrupted_dev, cfg, view_index=col,
                                      strength_override=strength,
-                                     eta=cfg.repair_eta_test)
+                                     eta=cfg.repair_eta)
         lp_repaired = lpips_fn(repaired_dev, clean_dev).item()
         improvement = lp_corrupted - lp_repaired
 
