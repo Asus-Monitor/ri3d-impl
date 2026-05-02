@@ -175,27 +175,21 @@ def run_stage1(cfg: RI3DConfig):
 
     device = cfg.device
 
-    
-    image_paths = cfg.load_image_paths()
-    poses = torch.load(out_dir / "dust3r_poses.pt", weights_only=True).float().to(device)
-    intrinsics = torch.load(out_dir / "dust3r_intrinsics.pt", weights_only=True).float().to(device)
+    from utils import load_scene_data, compute_scene_scale
+    scene = load_scene_data(cfg)
+    image_paths = scene["image_paths"]
+    poses = scene["poses"]
+    intrinsics = scene["intrinsics"]
+    n_images = scene["n_images"]
+    H, W = scene["H"], scene["W"]
+    gt_images = scene["gt_images"]
+    mono_depths = scene["mono_depths"]
+
     gaussians_init = torch.load(out_dir / "init_gaussians.pt", weights_only=True)
-    n_images = len(image_paths)
 
-    
-    fused_depth_0 = torch.load(out_dir / "fused_depths" / "fused_depth_000.pt", weights_only=True)
-    H, W = fused_depth_0.shape
-
-    
-    from utils import load_gt_images, load_mono_depths
-    gt_images = load_gt_images(image_paths, H, W, device)
-    mono_depths = load_mono_depths(out_dir, n_images, device)
-
-    
     model = GaussianModel(gaussians_init, device)
     optimizers = model.setup_optimizers(cfg)
 
-    from utils import compute_scene_scale
     scene_scale = compute_scene_scale(poses)
     print(f"  Scene scale: {scene_scale:.4f}")
     strategy, strategy_state = model.setup_strategy(cfg, scene_scale=scene_scale)

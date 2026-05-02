@@ -142,3 +142,36 @@ def compute_scene_scale(poses: torch.Tensor) -> float:
     cam_positions = poses[:, :3, 3]
     scale = (cam_positions - cam_positions.mean(dim=0)).norm(dim=1).mean().item()
     return max(scale, 0.1)
+
+
+def load_scene_data(cfg: RI3DConfig):
+    """Load the per-scene tensors shared by stage1/stage2 optimization.
+
+    Returns dict with: image_paths, poses, intrinsics, n_images, H, W,
+    gt_images, mono_depths, out_dir.
+    """
+    out_dir = cfg.scene_output_dir()
+    device = cfg.device
+
+    image_paths = cfg.load_image_paths()
+    poses = torch.load(out_dir / "dust3r_poses.pt", weights_only=True).float().to(device)
+    intrinsics = torch.load(out_dir / "dust3r_intrinsics.pt", weights_only=True).float().to(device)
+    n_images = len(image_paths)
+
+    fused_depth_0 = torch.load(out_dir / "fused_depths" / "fused_depth_000.pt", weights_only=True)
+    H, W = fused_depth_0.shape
+
+    gt_images = load_gt_images(image_paths, H, W, device)
+    mono_depths = load_mono_depths(out_dir, n_images, device)
+
+    return {
+        "out_dir": out_dir,
+        "image_paths": image_paths,
+        "poses": poses,
+        "intrinsics": intrinsics,
+        "n_images": n_images,
+        "H": H,
+        "W": W,
+        "gt_images": gt_images,
+        "mono_depths": mono_depths,
+    }

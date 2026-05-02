@@ -61,11 +61,6 @@ def unproject_depth(depth: torch.Tensor, K: torch.Tensor, c2w: torch.Tensor) -> 
     return pts_world
 
 
-def compute_pixel_size(depth: float, fx: float) -> float:
-    """Approximate size of a pixel in world units at given depth."""
-    return depth / fx
-
-
 def compute_scene_center(poses: torch.Tensor, points: torch.Tensor = None) -> torch.Tensor:
     """Compute scene center as the average look-at point of input cameras.
 

@@ -26,7 +26,6 @@ class RI3DConfig:
 
     # DUSt3R
     dust3r_model: str = "naver/DUSt3R_ViTLarge_BaseDecoder_512_dpt"
-    dust3r_confidence_threshold: float = 3.0  # log-confidence threshold for high-conf mask
 
     # Depth Anything V2
     depth_model: str = "depth-anything/Depth-Anything-V2-Small-hf"
@@ -52,7 +51,6 @@ class RI3DConfig:
     repair_hflip_augment: bool = True
     repair_snr_gamma: float = 5.0  # Min-SNR-γ weighting; ε-pred form: min(snr, γ)/snr
     repair_test_lpips_success: float = 0.10  # test PASS if LPIPS_repaired <= this
-    repair_image_loss_weight: float = 0.0  # disabled: VAE.decode backward is too expensive on 7.6 GB
     repair_strength: float = 0.6  # default img2img denoise strength (used by test)
     repair_strength_max: float = 1.0  # test/eval: full denoise to showcase repair power
     repair_strength_min: float = 0.1  # test/eval: minimal denoise on clean inputs
@@ -82,9 +80,6 @@ class RI3DConfig:
     # diluting the generic "best quality" subspace.
     repair_scene_token: str = "xxy5syt00"
     repair_positive_prompt: str = "a photo of a xxy5syt00, best quality"
-    # Negative prompt unused at CFG=1.0 (GaussianObject convention). Kept here
-    # only as documentation of what would be passed if CFG > 1 were enabled.
-    repair_negative_prompt: str = ""
 
     # Inpainting inference (standard DPM++ scheduler)
     inpainting_inference_steps: int = 30   # DPM++ steps
@@ -94,7 +89,6 @@ class RI3DConfig:
     # Leave-one-out training for repair
     loo_initial_iters: int = 6000  # iters before re-adding left-out view
     loo_total_iters: int = 10000   # total iters for leave-one-out 3DGS
-    loo_snapshot_interval: int = 300   # snapshot interval during phase 2 (6000-10000)
     loo_render_scale: float = 1.0     # LOO 3DGS training resolution scale (1.0 = full res)
 
     # Inpainting model (RealFill-style full UNet fine-tune, per paper Sec 4.2, 8.2)
