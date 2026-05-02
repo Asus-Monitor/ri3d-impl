@@ -107,7 +107,7 @@ class RI3DConfig:
     # they fix once the easy corrections are made. With warmup=100 and
     # refresh_interval=400, range(1300) covers refreshes at steps 100, 500,
     # 900 (step 1300 is past max_iters so the 4th refresh doesn't fire).
-    stage1_max_iters: int = 1300
+    stage1_max_iters: int = 901
     stage1_num_novel_views: int = 8
     stage1_refresh_interval: int = 400  # paper §8.3: repaired views refreshed every 400 iters
     # Warmup: train on inputs only first, so that when we render at novel views
