@@ -90,9 +90,17 @@ def repair_image(pipe, image_tensor: torch.Tensor, cfg: RI3DConfig,
 
     Args:
         image_tensor: (H, W, 3) float tensor in [0, 1]
-        view_index: deterministic seed offset for this view. Same view_index
-            produces same noise → consistent pseudo GT across refresh cycles,
-            preventing the optimization from getting conflicting gradients.
+        view_index: kept for caller compatibility but no longer affects the
+            DDIM seed. We use a constant seed across all views and refreshes:
+            with eta=1.0, same noise sequence + view-dependent inputs → the
+            model's output differs across views only via input differences,
+            not via independently-sampled posterior modes. Per-view seed
+            offsets caused inter-view inconsistency once the blob-augmented
+            repair model started doing real corrections (its output then
+            depended on the noise draw, not just the input). Constant seed
+            still gives temporal stability per view: across refreshes, the
+            input evolves with 3DGS, output evolves with input — noise itself
+            doesn't drift the output.
         strength_override: if set, overrides cfg.repair_strength. Used by
             Stage 1 for adaptive scheduling (high early → low late).
 
@@ -107,11 +115,9 @@ def repair_image(pipe, image_tensor: torch.Tensor, cfg: RI3DConfig,
     img_pil = Image.fromarray(img_np)
     img_resized, pipe_h, pipe_w = _prepare_for_pipeline(img_pil)
 
-    
-    
-    
-    
-    generator = torch.Generator(device=cfg.device).manual_seed(42 + view_index)
+    # Constant seed across views and refreshes (see view_index docstring).
+    del view_index  # acknowledged, not used for seeding
+    generator = torch.Generator(device=cfg.device).manual_seed(42)
 
     strength = strength_override if strength_override is not None else cfg.repair_strength
     eta_val = eta if eta is not None else cfg.repair_eta_optim
